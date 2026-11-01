@@ -5,8 +5,6 @@
 use std::io::Read;
 use std::ops::Bound;
 
-use bytes::BytesMut;
-
 // Keep the internal Buffer's full API without suppressing reader/decoder lints.
 #[allow(dead_code)]
 mod buffer;
@@ -150,7 +148,7 @@ impl<R: ?Sized + Read, D> FramedRead<R, D> {
 // Inline the decoding entry points into the caller's Item loop so framing
 // and extraction can be optimized without passing an intermediate result.
 impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
-    /// Decodes the next Item from framed bytes in an owned [`BytesMut`].
+    /// Decodes the next Item from framed bytes in an owned [`bytes::BytesMut`].
     ///
     /// Returns `None` when the input has ended and no further Item is
     /// available.
@@ -173,29 +171,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         let Some((range, consume)) = self.frame_ready::<true>()? else {
             return Ok(None);
         };
-        let bytes = match consume {
-            None => self.buffer.take_bytes(range, 0),
-            Some(consume) => {
-                let end = match range.1 {
-                    Bound::Included(end) => end.checked_add(1).expect("range end overflow"),
-                    Bound::Excluded(end) => end,
-                    Bound::Unbounded => self.buffer.len(),
-                };
-                match consume.checked_sub(end) {
-                    Some(addition) => self
-                        .buffer
-                        .take_bytes((range.0, Bound::Excluded(end)), addition),
-                    None => {
-                        let view = self
-                            .buffer
-                            .take_view((range.0, Bound::Excluded(end)), consume);
-                        let mut bytes = BytesMut::with_capacity(view.len());
-                        bytes.extend_from_slice(view);
-                        bytes
-                    }
-                }
-            }
-        };
+        let bytes = self.buffer.take_bytes(range, consume);
         // SAFETY: extraction supplies exactly the bytes selected by the most
         // recent framing call. Copying, when needed, preserves their contents;
         // neither path changes the decoder's parsing state.
@@ -225,10 +201,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         let Some((range, consume)) = self.frame_ready::<true>()? else {
             return Ok(None);
         };
-        let slice = match consume {
-            Some(consume) => self.buffer.take_view(range, consume),
-            None => self.buffer.take_split_view(range, 0),
-        };
+        let slice = self.buffer.take_view(range, consume);
         // SAFETY: the slice is the selection from the immediately preceding
         // framing call. No decoder call or state change has intervened.
         Ok(Some(unsafe { self.decoder.decode_view(slice)? }))
@@ -259,10 +232,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         let Some((range, consume)) = self.frame_ready::<{ cfg!(feature = "nightly") }>()? else {
             return Ok(None);
         };
-        let view = match consume {
-            Some(consume) => self.buffer.take_view(range, consume),
-            None => self.buffer.take_split_view(range, 0),
-        };
+        let view = self.buffer.take_view(range, consume);
         // SAFETY: the slice is the selection from the immediately preceding
         // framing call. No decoder call or state change has intervened.
         Ok(Some(unsafe { self.decoder.decode_owned(view)? }))

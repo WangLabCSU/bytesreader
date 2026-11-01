@@ -43,7 +43,7 @@ use bytes::{Buf, Bytes, BytesMut};
 /// let mut buffer = Buffer::with_capacity(8);
 /// buffer.extend_from_slice(b"abcdef");
 ///
-/// let view = buffer.take_view(..4, 4);
+/// let view = buffer.take_view(..4, None);
 /// assert_eq!(view, b"abcd");
 /// assert_eq!(buffer.buffer(), b"ef");
 ///
@@ -220,125 +220,45 @@ impl Buffer {
         unsafe { slice::from_raw_parts(self.buf.as_ptr().add(self.consumed), self.len()) }
     }
 
-    /// Returns a slice of the bytes in `range` and consumes the first `consume`
-    /// bytes of the buffer.
+    /// Returns `range` as independently owned bytes, consuming the first
+    /// `consume` bytes or, with `None`, everything through the range's end.
     ///
-    /// Both arguments refer to the buffered data before this call. Afterwards,
-    /// the buffer contains the bytes from `consume` onwards. The returned slice
-    /// can overlap those remaining bytes.
-    ///
-    /// No bytes are copied. The slice borrows the buffer, so it must no longer
-    /// be used before the buffer can be modified again.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
-    ///
-    /// let mut buf = Buffer::new();
-    /// buf.extend_from_slice(b"hello world");
-    /// let view = buf.take_view(6..11, 6);
-    ///
-    /// assert_eq!(view, b"world");
-    /// assert_eq!(buf.buffer(), b"world");
-    /// ```
+    /// Allocates and copies the selection if it overlaps data retained in the
+    /// buffer. Otherwise, splits off the selection without copying its bytes;
+    /// splitting may still allocate. All indices refer to the buffer before
+    /// this call.
     ///
     /// # Panics
     ///
-    /// Panics if `range` is invalid or `consume > self.len()`. The buffer is
-    /// unchanged in either case.
-    #[inline]
+    /// Panics if the range or consumption is out of bounds, without consuming
+    /// any bytes.
+    #[inline(always)]
     #[hotpath::measure(impl_type = "Buffer")]
-    pub fn take_view(&mut self, range: impl RangeBounds<usize>, consume: usize) -> &[u8] {
-        let len = self.len();
-        let end = match range.end_bound() {
-            Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
-            Bound::Excluded(&end) => end,
-            Bound::Unbounded => len,
-        };
-        let start = match range.start_bound() {
-            Bound::Included(&start) => start,
-            Bound::Excluded(&start) => start.checked_add(1).expect("range start overflow"),
-            Bound::Unbounded => 0,
-        };
-        assert!(start <= end && end <= len, "view range out of bounds");
-        assert!(consume <= len, "cannot consume view past buffered input");
-        // SAFETY: start and consume are at most buffered. Adding either to
-        // consumed is bounded by buf.len(); subtracting consume cannot
-        // underflow. The updates preserve consumed + buffered.
-        let offset = self.consumed + start;
-        self.consumed += consume;
-        self.buffered -= consume;
-        // SAFETY: the checked range lies within the previously buffered data.
-        // start <= end makes end - start valid, and offset + (end - start)
-        // is at most buf.len(). Consuming changes only the counts, so those
-        // initialized bytes remain in place. BytesMut provides a non-null,
-        // byte-aligned pointer, including for an empty slice. The returned
-        // borrow prevents further mutation.
-        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
-    }
-
-    /// Returns a slice of the bytes in `range`, consuming everything through
-    /// the end of that range and another `addition` bytes after it.
-    ///
-    /// Bytes before the range and the additional bytes are discarded. All
-    /// indices refer to the buffered data before this call.
-    ///
-    /// No bytes are copied. The returned slice borrows the buffer.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
-    ///
-    /// let mut buf = Buffer::new();
-    /// buf.extend_from_slice(b"<hello>tail");
-    /// let view = buf.take_split_view(1..6, 1);
-    ///
-    /// assert_eq!(view, b"hello");
-    /// assert_eq!(buf.buffer(), b"tail");
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if `range` is invalid or its end plus `addition` exceeds
-    /// `self.len()`. The buffer is unchanged in either case.
-    #[inline]
-    #[hotpath::measure(impl_type = "Buffer")]
-    pub fn take_split_view(&mut self, range: impl RangeBounds<usize>, addition: usize) -> &[u8] {
-        let len = self.len();
-        let end = match range.end_bound() {
-            Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
-            Bound::Excluded(&end) => end,
-            Bound::Unbounded => len,
-        };
-        let start = match range.start_bound() {
-            Bound::Included(&start) => start,
-            Bound::Excluded(&start) => start.checked_add(1).expect("range start overflow"),
-            Bound::Unbounded => 0,
-        };
-        assert!(start <= end && end <= len, "view range out of bounds");
-        // SAFETY: end <= len makes len - end valid. Checking the remaining
-        // space before adding also rejects an overflowing end + addition.
-        assert!(
-            addition <= len - end,
-            "cannot consume view past buffered input"
-        );
-        // SAFETY: addition <= len - end gives end + addition <= buffered,
-        // so consume cannot overflow. start and consume are at most buffered;
-        // adding either to consumed is bounded by buf.len(), and subtracting
-        // consume cannot underflow. The updates preserve consumed + buffered.
-        let consume = end + addition;
-        let offset = self.consumed + start;
-        self.consumed += consume;
-        self.buffered -= consume;
-        // SAFETY: the checked range lies within the previously buffered data.
-        // start <= end makes end - start valid, and offset + (end - start)
-        // is at most buf.len(). Consuming changes only the counts, so those
-        // initialized bytes remain in place. BytesMut provides a non-null,
-        // byte-aligned pointer, including for an empty slice. The returned
-        // borrow prevents further mutation.
-        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
+    pub fn take_bytes(
+        &mut self,
+        range: impl RangeBounds<usize>,
+        consume: Option<usize>,
+    ) -> BytesMut {
+        match consume {
+            None => self.split_bytes(range, 0),
+            Some(consume) => {
+                let end = match range.end_bound() {
+                    Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
+                    Bound::Excluded(&end) => end,
+                    Bound::Unbounded => self.len(),
+                };
+                let range = (range.start_bound().cloned(), Bound::Excluded(end));
+                match consume.checked_sub(end) {
+                    Some(addition) => self.split_bytes(range, addition),
+                    None => {
+                        let view = self.take_view_with_consume(range, consume);
+                        let mut bytes = BytesMut::with_capacity(view.len());
+                        bytes.extend_from_slice(view);
+                        bytes
+                    }
+                }
+            }
+        }
     }
 
     /// Returns the bytes in `range` as a [`BytesMut`], consuming everything
@@ -359,7 +279,7 @@ impl Buffer {
     ///
     /// let mut buf = Buffer::new();
     /// buf.extend_from_slice(b"<hello>tail");
-    /// let bytes = buf.take_bytes(1..6, 1);
+    /// let bytes = buf.split_bytes(1..6, 1);
     ///
     /// assert_eq!(&bytes[..], b"hello");
     /// assert_eq!(buf.buffer(), b"tail");
@@ -373,7 +293,7 @@ impl Buffer {
     // branches.
     #[inline(always)]
     #[hotpath::measure(impl_type = "Buffer")]
-    pub fn take_bytes(&mut self, range: impl RangeBounds<usize>, addition: usize) -> BytesMut {
+    fn split_bytes(&mut self, range: impl RangeBounds<usize>, addition: usize) -> BytesMut {
         let len = self.len();
         let end = match range.end_bound() {
             Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
@@ -408,6 +328,105 @@ impl Buffer {
             bytes.advance(skip);
         }
         bytes
+    }
+
+    /// Returns a slice of the bytes in `range` and consumes a prefix of the
+    /// buffer. `None` consumes through the range's end; `Some(n)` consumes
+    /// exactly `n` bytes, including zero to retain all input.
+    ///
+    /// Both arguments refer to the buffered data before this call. The returned
+    /// slice can overlap the bytes remaining in the buffer.
+    ///
+    /// No bytes are copied. The slice borrows the buffer, so it must no longer
+    /// be used before the buffer can be modified again.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// use crate::read::buffer::Buffer;
+    ///
+    /// let mut buf = Buffer::new();
+    /// buf.extend_from_slice(b"hello world");
+    /// let view = buf.take_view(6..11, Some(6));
+    ///
+    /// assert_eq!(view, b"world");
+    /// assert_eq!(buf.buffer(), b"world");
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is invalid or the requested consumption exceeds the
+    /// buffer's length. The buffer is unchanged in either case.
+    #[inline(always)]
+    #[hotpath::measure(impl_type = "Buffer")]
+    pub fn take_view(&mut self, range: impl RangeBounds<usize>, consume: Option<usize>) -> &[u8] {
+        // Dispatch before range handling. Combining the two paths regressed some
+        // small-Item file benchmarks with explicit consumption. Keep the private
+        // extraction paths separate so each can optimize with its caller.
+        match consume {
+            Some(consume) => self.take_view_with_consume(range, consume),
+            None => self.take_view_with_none(range),
+        }
+    }
+
+    #[inline]
+    fn take_view_with_consume(&mut self, range: impl RangeBounds<usize>, consume: usize) -> &[u8] {
+        let len = self.len();
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => len,
+        };
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start.checked_add(1).expect("range start overflow"),
+            Bound::Unbounded => 0,
+        };
+        assert!(start <= end && end <= len, "view range out of bounds");
+        assert!(consume <= len, "cannot consume view past buffered input");
+        // SAFETY: start and consume are at most buffered. Adding either to
+        // consumed is bounded by buf.len(); subtracting consume cannot
+        // underflow. The updates preserve consumed + buffered.
+        let offset = self.consumed + start;
+        self.consumed += consume;
+        self.buffered -= consume;
+        // SAFETY: the checked range lies within the previously buffered data.
+        // start <= end makes end - start valid, and offset + (end - start)
+        // is at most buf.len(). Consuming changes only the counts, so those
+        // initialized bytes remain in place. BytesMut provides a non-null,
+        // byte-aligned pointer, including for an empty slice. The returned
+        // borrow prevents further mutation.
+        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
+    }
+
+    #[inline]
+    fn take_view_with_none(&mut self, range: impl RangeBounds<usize>) -> &[u8] {
+        let len = self.len();
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => len,
+        };
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start.checked_add(1).expect("range start overflow"),
+            Bound::Unbounded => 0,
+        };
+        assert!(start <= end && end <= len, "view range out of bounds");
+        // SAFETY: addition <= len - end gives end + addition <= buffered,
+        // so consume cannot overflow. start and consume are at most buffered;
+        // adding either to consumed is bounded by buf.len(), and subtracting
+        // consume cannot underflow. The updates preserve consumed + buffered.
+        let offset = self.consumed + start;
+        self.consumed += end;
+        self.buffered -= end;
+        // SAFETY: the checked range lies within the previously buffered data.
+        // start <= end makes end - start valid, and offset + (end - start)
+        // is at most buf.len(). Consuming changes only the counts, so those
+        // initialized bytes remain in place. BytesMut provides a non-null,
+        // byte-aligned pointer, including for an empty slice. The returned
+        // borrow prevents further mutation.
+        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
     }
 
     /// Consumes the first `amt` bytes from the buffer.
@@ -1337,7 +1356,7 @@ mod test {
         assert_eq!(segments(&buffer), [0, 12, 20]);
         buffer.consume(2);
         assert_eq!(segments(&buffer), [2, 10, 20]);
-        let item = buffer.take_bytes(1..4, 1);
+        let item = buffer.split_bytes(1..4, 1);
         assert_eq!(&item[..], b"def");
         assert_eq!(segments(&buffer), [1, 5, 20]);
         drop(item);
@@ -1419,7 +1438,7 @@ mod test {
     }
 
     #[test]
-    fn take_bytes_selects_without_copying_and_consumes_the_extra_prefix() {
+    fn split_bytes_selects_without_copying_and_consumes_the_extra_prefix() {
         use std::ops::Bound::{Excluded, Included};
 
         for initialized in [false, true] {
@@ -1434,7 +1453,7 @@ mod test {
             let address = buffer.buffer().as_ptr();
             let initialized_spare = buffer.spare_len();
 
-            let bytes = buffer.take_bytes((Excluded(0), Included(3)), 2);
+            let bytes = buffer.split_bytes((Excluded(0), Included(3)), 2);
             assert_eq!(&bytes[..], b"bcd");
             assert_eq!(bytes.as_ptr(), address.wrapping_add(1));
             assert_eq!(buffer.buffer(), b"gh");
@@ -1448,26 +1467,26 @@ mod test {
     }
 
     #[test]
-    fn split_extraction_handles_empty_full_and_invalid_ranges() {
+    fn extraction_handles_empty_full_and_invalid_ranges() {
         use std::ops::Bound::{Excluded, Included, Unbounded};
 
-        assert!(Buffer::new().take_bytes(.., 0).is_empty());
-        assert!(Buffer::new().take_split_view(.., 0).is_empty());
+        assert!(Buffer::new().split_bytes(.., 0).is_empty());
+        assert!(Buffer::new().take_view(.., None).is_empty());
         let mut buffer = Buffer::new();
         buffer.extend_from_slice(b"abcdef");
-        assert!(buffer.take_bytes(2..2, 1).is_empty());
+        assert!(buffer.split_bytes(2..2, 1).is_empty());
         assert_eq!(buffer.buffer(), b"def");
-        assert_eq!(&buffer.take_bytes(.., 0)[..], b"def");
+        assert_eq!(&buffer.split_bytes(.., 0)[..], b"def");
         assert!(buffer.is_empty());
 
-        for (range, addition) in [
-            ((Included(3), Excluded(2)), 0),
-            ((Unbounded, Excluded(7)), 0),
-            ((Excluded(usize::MAX), Unbounded), 0),
-            ((Unbounded, Included(usize::MAX)), 0),
-            ((Unbounded, Excluded(2)), 5),
-            ((Unbounded, Excluded(1)), usize::MAX),
-            ((Unbounded, Excluded(2)), usize::MAX - 1),
+        for (range, addition, consume) in [
+            ((Included(3), Excluded(2)), 0, None),
+            ((Unbounded, Excluded(7)), 0, None),
+            ((Excluded(usize::MAX), Unbounded), 0, None),
+            ((Unbounded, Included(usize::MAX)), 0, None),
+            ((Unbounded, Excluded(2)), 5, Some(7)),
+            ((Unbounded, Excluded(1)), usize::MAX, Some(usize::MAX)),
+            ((Unbounded, Excluded(2)), usize::MAX - 1, Some(usize::MAX)),
         ] {
             let mut buffer = Buffer::new();
             buffer.extend_from_slice(b"abcdef");
@@ -1482,9 +1501,9 @@ mod test {
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| {
                         if borrowed {
-                            buffer.take_split_view(range, addition);
+                            buffer.take_view(range, consume);
                         } else {
-                            buffer.take_bytes(range, addition);
+                            buffer.split_bytes(range, addition);
                         }
                     }))
                     .is_err()
@@ -2294,7 +2313,7 @@ mod test {
                     3 => {
                         let at = amount.min(expected.len());
                         retained.push((
-                            buffer.take_bytes(..at, 0),
+                            buffer.split_bytes(..at, 0),
                             expected.drain(..at).collect::<Vec<_>>(),
                         ));
                     }
@@ -2318,7 +2337,10 @@ mod test {
                         let start = next() % (expected.len() + 1);
                         let end = start + next() % (expected.len() - start + 1);
                         let consume = amount.min(expected.len());
-                        assert_eq!(buffer.take_view(start..end, consume), &expected[start..end]);
+                        assert_eq!(
+                            buffer.take_view(start..end, Some(consume)),
+                            &expected[start..end]
+                        );
                         expected.drain(..consume);
                     }
                     _ => {
@@ -2355,7 +2377,7 @@ mod test {
                     buffer.advance(4);
                     let original = buffer.buffer().as_ptr();
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        let view = buffer.take_view(start..end, consume);
+                        let view = buffer.take_view(start..end, Some(consume));
                         assert_eq!(view, &data[start..end]);
                         assert_eq!(view.as_ptr(), original.wrapping_add(start));
                     }));
@@ -2556,7 +2578,7 @@ mod test {
             let mut source = &input[..];
             let first_len = buffer.fill_buf(&mut source).unwrap().len();
             assert!(first_len > 0);
-            let owned = buffer.take_bytes(..first_len, 0);
+            let owned = buffer.split_bytes(..first_len, 0);
             let mut output = owned.to_vec();
             loop {
                 let chunk = buffer.fill_buf(&mut source).unwrap();
@@ -2752,7 +2774,7 @@ mod test {
     #[test]
     fn take_views_accept_ranges_without_copying() {
         fn check<I: std::ops::RangeBounds<usize> + Clone>(range: I, start: usize, end: usize) {
-            for consume in [0, 2, 6] {
+            for consume in [None].into_iter().chain((0..=6).map(Some)) {
                 let mut buffer = Buffer::with_capacity(32);
                 buffer.extend_from_slice(b"old:abcdef");
                 buffer.consume(4);
@@ -2760,17 +2782,7 @@ mod test {
                 let view = buffer.take_view(range.clone(), consume);
                 assert_eq!(view, &b"abcdef"[start..end]);
                 assert_eq!(view.as_ptr(), address.wrapping_add(start));
-                assert_eq!(buffer.buffer(), &b"abcdef"[consume..]);
-            }
-            for addition in 0..=6 - end {
-                let mut buffer = Buffer::with_capacity(32);
-                buffer.extend_from_slice(b"old:abcdef");
-                buffer.consume(4);
-                let address = buffer.buffer().as_ptr();
-                let view = buffer.take_split_view(range.clone(), addition);
-                assert_eq!(view, &b"abcdef"[start..end]);
-                assert_eq!(view.as_ptr(), address.wrapping_add(start));
-                assert_eq!(buffer.buffer(), &b"abcdef"[end + addition..]);
+                assert_eq!(buffer.buffer(), &b"abcdef"[consume.unwrap_or(end)..]);
             }
         }
         check(.., 0, 6);
@@ -2800,7 +2812,7 @@ mod test {
             let consumed = buffer.consumed();
             assert!(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    buffer.take_view(range, consume);
+                    buffer.take_view(range, Some(consume));
                 }))
                 .is_err()
             );
@@ -2840,7 +2852,7 @@ mod test {
             buffer.extend_from_slice(b"old:abcdef");
             buffer.consume(4);
             let address = buffer.buffer().as_ptr();
-            let view = buffer.take_view(Tail(2), 1);
+            let view = buffer.take_view(Tail(2), Some(1));
             assert_eq!(view, b"cdef");
             assert_eq!(view.as_ptr(), address.wrapping_add(2));
             assert_eq!(buffer.buffer(), b"bcdef");

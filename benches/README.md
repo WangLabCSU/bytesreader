@@ -79,18 +79,20 @@ Instrumentation covers the complete file and the individual reading stages:
 - `FramedRead::decode_bytes`, `decode_view`, `decode_owned` and `frame_ready`.
 - The example's `Lines::frame` scanner and `Lines::decode_owned` allocation
   and copy. Its bytes and view decoders only return their input.
-- Buffer extraction (`take_bytes`, `take_view`, `take_split_view`).
+- Buffer extraction (`take_bytes`, `take_view`) and byte splitting (`split_bytes`).
 - Buffer creation, refill and making room for more input.
 
-Accessors and individual consumption, initialization, split and append helpers
+Accessors and individual consumption, initialization and append helpers
 are not instrumented separately. A report only contains operations that ran;
-for example, `take_view` is absent when every frame uses default consumption.
+for example, `take_view` is absent when bytes Items are always split off.
 The example shows all recorded functions instead of limiting the table to the
 top entries. To distinguish work inside your own codec, annotate its costly
 framing or decoding methods as demonstrated by `Lines`.
 
 Durations include nested calls: `frame_ready` includes `Lines::frame` and any
 refill; `decode_owned` includes framing, extraction and `Lines::decode_owned`.
+`take_bytes` includes `split_bytes` when the selection can be split off, or
+`take_view` and allocation and copying when it overlaps retained input.
 Do not add parent and child durations together. Allocation rows are exclusive
 by default. The owned example copies each full Item into a fresh `Vec`, now
 attributed to `Lines::decode_owned`; other `OwnedDecoder` implementations need
