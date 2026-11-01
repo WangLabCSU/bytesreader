@@ -180,16 +180,18 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
                     Bound::Excluded(end) => end,
                     Bound::Unbounded => self.buffer.len(),
                 };
-                if consume >= end {
-                    self.buffer
-                        .take_bytes((range.0, Bound::Excluded(end)), consume - end)
-                } else {
-                    let view = self
+                match consume.checked_sub(end) {
+                    Some(addition) => self
                         .buffer
-                        .take_view((range.0, Bound::Excluded(end)), consume);
-                    let mut bytes = BytesMut::with_capacity(view.len());
-                    bytes.extend_from_slice(view);
-                    bytes
+                        .take_bytes((range.0, Bound::Excluded(end)), addition),
+                    None => {
+                        let view = self
+                            .buffer
+                            .take_view((range.0, Bound::Excluded(end)), consume);
+                        let mut bytes = BytesMut::with_capacity(view.len());
+                        bytes.extend_from_slice(view);
+                        bytes
+                    }
                 }
             }
         };
