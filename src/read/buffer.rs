@@ -156,18 +156,23 @@ impl Buffer {
     /// [`reserve`](Self::reserve) to request more.
     #[inline]
     pub fn spare(&self) -> usize {
+        // SAFETY: consumed + buffered <= buf.len() <= capacity, so neither
+        // subtraction can underflow.
         self.buf.capacity() - self.consumed - self.buffered
     }
 
     // Initialized bytes after the buffered data, available for the next read.
     #[inline]
     fn spare_len(&self) -> usize {
+        // SAFETY: consumed + buffered <= buf.len(), so both subtractions
+        // stay within the initialized length.
         self.buf.len() - self.consumed - self.buffered
     }
 
     // Capacity beyond the initialized bytes.
     #[inline]
     fn spare_capacity(&self) -> usize {
+        // SAFETY: BytesMut maintains len <= capacity.
         self.buf.capacity() - self.buf.len()
     }
 
@@ -256,12 +261,18 @@ impl Buffer {
         };
         assert!(start <= end && end <= len, "view range out of bounds");
         assert!(consume <= len, "cannot consume view past buffered input");
+        // SAFETY: start and consume are at most buffered. Adding either to
+        // consumed is bounded by buf.len(); subtracting consume cannot
+        // underflow. The updates preserve consumed + buffered.
         let offset = self.consumed + start;
         self.consumed += consume;
         self.buffered -= consume;
         // SAFETY: the checked range lies within the previously buffered data.
-        // Consuming changes only the counts, so those initialized bytes remain
-        // in place. The returned borrow prevents further mutation.
+        // start <= end makes end - start valid, and offset + (end - start)
+        // is at most buf.len(). Consuming changes only the counts, so those
+        // initialized bytes remain in place. BytesMut provides a non-null,
+        // byte-aligned pointer, including for an empty slice. The returned
+        // borrow prevents further mutation.
         unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
     }
 
@@ -304,19 +315,26 @@ impl Buffer {
             Bound::Unbounded => 0,
         };
         assert!(start <= end && end <= len, "view range out of bounds");
-        // end <= len makes subtraction safe. Checking the remaining space
-        // before adding also rejects an overflowing end + addition.
+        // SAFETY: end <= len makes len - end valid. Checking the remaining
+        // space before adding also rejects an overflowing end + addition.
         assert!(
             addition <= len - end,
             "cannot consume view past buffered input"
         );
+        // SAFETY: addition <= len - end gives end + addition <= buffered,
+        // so consume cannot overflow. start and consume are at most buffered;
+        // adding either to consumed is bounded by buf.len(), and subtracting
+        // consume cannot underflow. The updates preserve consumed + buffered.
         let consume = end + addition;
         let offset = self.consumed + start;
         self.consumed += consume;
         self.buffered -= consume;
         // SAFETY: the checked range lies within the previously buffered data.
-        // Consuming changes only the counts, so those initialized bytes remain
-        // in place. The returned borrow prevents further mutation.
+        // start <= end makes end - start valid, and offset + (end - start)
+        // is at most buf.len(). Consuming changes only the counts, so those
+        // initialized bytes remain in place. BytesMut provides a non-null,
+        // byte-aligned pointer, including for an empty slice. The returned
+        // borrow prevents further mutation.
         unsafe { slice::from_raw_parts(self.buf.as_ptr().add(offset), end - start) }
     }
 
@@ -364,14 +382,19 @@ impl Buffer {
             Bound::Unbounded => 0,
         };
         assert!(start <= end && end <= len, "bytes range out of bounds");
-        // end <= len above makes subtraction safe; addition could overflow a
-        // sum.
+        // SAFETY: end <= len makes len - end valid. Checking addition against
+        // that remainder bounds end + addition by buffered without overflow.
         assert!(addition <= len - end, "cannot consume past buffered input");
         // Split before discarding prefixes: promoting BytesMut to shared
         // storage can allocate. An allocation panic must leave these counts
         // consistent.
+        // SAFETY: start <= end <= buffered and consumed + buffered <=
+        // buf.len() bound both offsets by the initialized length.
         let skip = self.consumed + start;
         let mut bytes = self.buf.split_to(self.consumed + end);
+        // SAFETY: end + addition <= buffered prevents subtraction underflow.
+        // split_to removes old consumed + end bytes; the new counts sum to
+        // old buffered - end, within the remaining initialized length.
         self.buffered -= end + addition;
         self.consumed = addition;
         if skip != 0 {
@@ -406,6 +429,8 @@ impl Buffer {
     pub fn consume(&mut self, amt: usize) {
         if amt > 0 {
             assert!(amt <= self.buffered, "cannot consume past buffered input");
+            // SAFETY: amt <= buffered bounds consumed + amt by buf.len() and
+            // prevents subtraction underflow. The sum of the counts is unchanged.
             self.consumed += amt;
             self.buffered -= amt;
         }
@@ -435,6 +460,8 @@ impl Buffer {
         if self.is_empty() {
             self.clear();
         } else if self.consumed != 0 {
+            // SAFETY: consumed + buffered <= buf.len() bounds the source end
+            // without overflow; the destination ends at buffered <= buf.len().
             // Source and destination overlap when less than half the data
             // has been consumed. copy_within supports that overlap.
             self.buf
@@ -523,6 +550,7 @@ impl Buffer {
         // Compact only if it supplies the whole request and moves no more
         // bytes than have been consumed. This prevents repeated small appends
         // from copying the same large remainder on every reservation.
+        // SAFETY: spare + consumed == capacity - buffered <= capacity.
         if additional <= self.spare() + self.consumed && self.consumed >= self.buffered {
             self.compact();
             return true;
@@ -606,8 +634,11 @@ impl Buffer {
     #[inline]
     pub fn try_init(&mut self, val: u8, len: usize) {
         assert!(len <= self.spare(), "insufficient append space");
+        // SAFETY: consumed + buffered <= buf.len(), and the check bounds the
+        // final sum by capacity. Neither addition can overflow.
         let end = (self.consumed + self.buffered) + len;
         if end > self.buf.len() {
+            // SAFETY: this branch establishes end > buf.len().
             let additional = end - self.buf.len();
             let spare = self.buf.spare_capacity_mut();
 
@@ -660,6 +691,8 @@ impl Buffer {
     #[inline(always)]
     fn write_init_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         self.try_init(0, self.spare());
+        // SAFETY: consumed + buffered <= buf.len() bounds filled and makes
+        // buf.len() - filled nonnegative.
         let filled = self.consumed + self.buffered;
         let available = self.buf.len() - filled;
         // SAFETY: consumed + buffered <= buf.len() by the buffer invariant.
@@ -675,6 +708,8 @@ impl Buffer {
             nread <= available,
             "Read returned {nread} bytes for a buffer of {available} bytes"
         );
+        // SAFETY: nread <= buf.len() - (consumed + buffered), so the updated
+        // count cannot overflow and consumed + buffered remains <= buf.len().
         self.buffered += nread;
         Ok(nread)
     }
@@ -683,6 +718,7 @@ impl Buffer {
     #[inline(always)]
     fn write_uninit_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         let capacity = self.buf.capacity();
+        // SAFETY: consumed + buffered <= buf.len() <= capacity.
         let filled = self.consumed + self.buffered;
         // buf.len() includes initialized spare bytes; filled ends the input.
         // Neither boundary implies that those bytes contain zeros.
@@ -718,6 +754,8 @@ impl Buffer {
         let len = if dst.is_init() {
             capacity
         } else {
+            // SAFETY: dst covers capacity - filled bytes, and BorrowedBuf
+            // bounds nread by that length, so this sum is at most capacity.
             filled + nread
         };
         // SAFETY: the existing input and BorrowedBuf's filled prefix form a
@@ -727,6 +765,8 @@ impl Buffer {
         result?;
         // Initialization alone does not make bytes input. Commit only the
         // bytes reported by a successful read, including zero at EOF.
+        // SAFETY: filled + nread <= len, so buffered + nread cannot overflow
+        // and the updated consumed + buffered stays within buf.len().
         self.buffered += nread;
         Ok(nread)
     }
@@ -761,7 +801,10 @@ impl Buffer {
         // Keep buf.len() unchanged to retain initialized spare space. Only
         // move when the consumed prefix is at least as large as the data kept
         // and reclaiming it supplies the next read batch.
+        // SAFETY: spare + consumed == capacity - buffered <= capacity.
         if min_spare <= self.spare() + self.consumed && self.consumed >= self.buffered {
+            // SAFETY: consumed + buffered <= buf.len() bounds the source end
+            // without overflow; copy_within permits overlapping ranges.
             self.buf
                 .copy_within(self.consumed..(self.consumed + self.buffered), 0);
             self.consumed = 0;
@@ -791,6 +834,9 @@ impl Buffer {
         // without growing the allocation.
         let additional = if self.buffered > min_spare {
             let cap = self.buffer_size.saturating_mul(2).min(isize::MAX as usize);
+            // SAFETY: buffer_size tracks at least the current capacity, and
+            // BytesMut's length is at most isize::MAX. Both bounds used to
+            // form cap are therefore >= buf.len(), preventing underflow.
             cap - self.buf.len()
         } else {
             min_spare
@@ -848,6 +894,8 @@ impl Buffer {
             self.len(),
         );
         let offset = self.consumed;
+        // SAFETY: at <= buffered and consumed + buffered <= buf.len() bound
+        // offset + at by the initialized length without overflow.
         let end = offset + at;
 
         let mut other = self.buf.split_to(end);
@@ -857,6 +905,8 @@ impl Buffer {
             other.advance(offset);
         }
 
+        // SAFETY: at <= buffered prevents underflow. After splitting at end,
+        // buffered - at is within the remaining initialized length.
         self.buffered -= at;
         self.consumed = 0;
 
@@ -898,6 +948,9 @@ impl Buffer {
             self.len(),
         );
 
+        // SAFETY: at <= buffered bounds consumed + at by buf.len() and makes
+        // buffered - at nonnegative. The returned view contains that many
+        // initialized bytes after split.
         let split = self.consumed + at;
         let mut other = self.buf.split_off(split);
         other.truncate(self.buffered - at);
@@ -929,6 +982,9 @@ impl Buffer {
         let cnt = extend.len();
         self.reserve(cnt);
         let len = self.buf.len();
+        // SAFETY: consumed + buffered <= buf.len(). reserve guarantees cnt
+        // bytes after filled, so filled + cnt and buffered + cnt cannot
+        // overflow and the updated counts fit the initialized length below.
         let filled = self.consumed + self.buffered;
 
         // SAFETY: reserve guarantees filled + cnt <= capacity. extend is a
@@ -991,6 +1047,9 @@ impl Buffer {
         let cnt = extend.len();
         self.reserve(cnt);
         let len = self.buf.len();
+        // SAFETY: the checked range gives start + cnt <= buffered. reserve
+        // preserves buffered and provides cnt spare bytes, bounding all source
+        // and destination sums below by the current capacity.
         let src_start = self.consumed + start;
         let dst_start = self.consumed + self.buffered;
 
@@ -1023,6 +1082,8 @@ impl Buf for Buffer {
             cnt <= self.remaining(),
             "cannot advance past remaining input"
         );
+        // SAFETY: cnt <= buffered bounds consumed + cnt by buf.len() and
+        // prevents subtraction underflow. The sum of the counts is unchanged.
         self.consumed += cnt;
         self.buffered -= cnt;
     }
