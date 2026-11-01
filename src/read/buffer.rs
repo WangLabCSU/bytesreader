@@ -671,8 +671,7 @@ impl Buffer {
     ///
     /// Panics if the reader panics, or `read` reports more bytes than the
     /// destination can hold.
-    // Inline so the concrete Read implementation and the framing loop can
-    // optimize their buffer access together.
+    // Inline to optimize buffer access with the concrete Read implementation.
     #[inline(always)]
     #[hotpath::measure(impl_type = "Buffer")]
     pub fn write_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {

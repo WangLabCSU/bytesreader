@@ -170,7 +170,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     where
         D: BytesDecoder,
     {
-        let Some((range, consume)) = self.frame_ready()? else {
+        let Some((range, consume)) = self.frame_ready::<true>()? else {
             return Ok(None);
         };
         let bytes = match consume {
@@ -222,7 +222,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     where
         D: ViewDecoder,
     {
-        let Some((range, consume)) = self.frame_ready()? else {
+        let Some((range, consume)) = self.frame_ready::<true>()? else {
             return Ok(None);
         };
         let slice = match consume {
@@ -254,7 +254,9 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     where
         D: OwnedDecoder,
     {
-        let Some((range, consume)) = self.frame_ready()? else {
+        // Outlining the refill improved some small-Item benchmarks with
+        // initialized reads. Nightly read_buf stays inline to avoid regressions.
+        let Some((range, consume)) = self.frame_ready::<{ cfg!(feature = "nightly") }>()? else {
             return Ok(None);
         };
         let view = match consume {
@@ -266,10 +268,39 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
         Ok(Some(unsafe { self.decoder.decode_owned(view)? }))
     }
 
-    // Keep framing in the caller's Item loop.
+    // Inline this dispatcher so the const choice adds no runtime branch.
+    // Repeated file benchmarks (0-500 B payloads, 8 KiB buffers, profiling off)
+    // favored outlining for some non-nightly owned workloads. Bytes had no
+    // consistent winner; outlining view or nightly owned regressed some sizes.
+    // Keep their inline path and remeasure when changing the compiler or codec.
+    #[inline(always)]
+    fn refill<const INLINE: bool>(&mut self) -> std::io::Result<usize> {
+        if INLINE {
+            self.refile_inline()
+        } else {
+            self.refile_outline()
+        }
+    }
+
+    // Allow write_buf and the concrete Read implementation into frame_ready.
+    #[inline(always)]
+    fn refile_inline(&mut self) -> std::io::Result<usize> {
+        self.buffer.write_buf(&mut self.inner)
+    }
+
+    // Preserve the call boundary even though Buffer::write_buf is inline.
+    #[inline(never)]
+    fn refile_outline(&mut self) -> std::io::Result<usize> {
+        self.buffer.write_buf(&mut self.inner)
+    }
+
+    // Keep framing and the decode_* entry points in the caller's Item loop:
+    // outlining either slowed the small-Item file benchmarks.
     #[inline(always)]
     #[hotpath::measure(impl_type = "FramedRead")]
-    fn frame_ready(&mut self) -> Result<Option<(FrameRange, Option<usize>)>, D::Error> {
+    fn frame_ready<const REFILL_INLINE: bool>(
+        &mut self,
+    ) -> Result<Option<(FrameRange, Option<usize>)>, D::Error> {
         loop {
             let buf = self.buffer.buffer();
             let frame = if self.eof {
@@ -295,7 +326,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
 
                 FrameAction::NeedMore => {
                     self.buffer.consume(frame.consume().unwrap_or(0));
-                    let nread = self.buffer.write_buf(&mut self.inner)?;
+                    let nread = self.refill::<REFILL_INLINE>()?;
                     if nread == 0 {
                         std::hint::cold_path();
                         if self.eof {
