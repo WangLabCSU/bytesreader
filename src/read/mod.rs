@@ -165,6 +165,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     /// Panics if the supplied [`Framer`] returns an invalid framing decision,
     /// or if the [`Framer`] or [`BytesDecoder`] implementation panics.
     #[inline(always)]
+    #[hotpath::measure(impl_type = "FramedRead")]
     pub fn decode_bytes(&mut self) -> Result<Option<D::Item>, D::Error>
     where
         D: BytesDecoder,
@@ -216,6 +217,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     /// Panics if the supplied [`Framer`] returns an invalid framing decision,
     /// or if the [`Framer`] or [`ViewDecoder`] implementation panics.
     #[inline(always)]
+    #[hotpath::measure(impl_type = "FramedRead")]
     pub fn decode_view(&mut self) -> Result<Option<D::Item<'_>>, D::Error>
     where
         D: ViewDecoder,
@@ -247,6 +249,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
     /// Panics if the supplied [`Framer`] returns an invalid framing decision,
     /// or if the [`Framer`] or [`OwnedDecoder`] implementation panics.
     #[inline(always)]
+    #[hotpath::measure(impl_type = "FramedRead")]
     pub fn decode_owned(&mut self) -> Result<Option<D::Item>, D::Error>
     where
         D: OwnedDecoder,
@@ -265,6 +268,7 @@ impl<R: ?Sized + Read, D: Framer> FramedRead<R, D> {
 
     // Keep framing in the caller's Item loop.
     #[inline(always)]
+    #[hotpath::measure(impl_type = "FramedRead")]
     fn frame_ready(&mut self) -> Result<Option<(FrameRange, Option<usize>)>, D::Error> {
         loop {
             let buf = self.buffer.buffer();

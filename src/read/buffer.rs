@@ -99,6 +99,7 @@ impl Buffer {
     ///
     /// Panics if the requested capacity exceeds the slice-size limit.
     #[inline]
+    #[hotpath::measure(impl_type = "Buffer")]
     pub fn with_capacity(capacity: usize) -> Self {
         let buf = BytesMut::with_capacity(capacity);
         Self {
@@ -247,6 +248,7 @@ impl Buffer {
     /// Panics if `range` is invalid or `consume > self.len()`. The buffer is
     /// unchanged in either case.
     #[inline]
+    #[hotpath::measure(impl_type = "Buffer")]
     pub fn take_view(&mut self, range: impl RangeBounds<usize>, consume: usize) -> &[u8] {
         let len = self.len();
         let end = match range.end_bound() {
@@ -302,6 +304,7 @@ impl Buffer {
     /// Panics if `range` is invalid or its end plus `addition` exceeds
     /// `self.len()`. The buffer is unchanged in either case.
     #[inline]
+    #[hotpath::measure(impl_type = "Buffer")]
     pub fn take_split_view(&mut self, range: impl RangeBounds<usize>, addition: usize) -> &[u8] {
         let len = self.len();
         let end = match range.end_bound() {
@@ -369,6 +372,7 @@ impl Buffer {
     // Inline so constant frame bounds can eliminate unused range-handling
     // branches.
     #[inline(always)]
+    #[hotpath::measure(impl_type = "Buffer")]
     pub fn take_bytes(&mut self, range: impl RangeBounds<usize>, addition: usize) -> BytesMut {
         let len = self.len();
         let end = match range.end_bound() {
@@ -670,6 +674,7 @@ impl Buffer {
     // Inline so the concrete Read implementation and the framing loop can
     // optimize their buffer access together.
     #[inline(always)]
+    #[hotpath::measure(impl_type = "Buffer")]
     pub fn write_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         // Always supply space: an empty destination could return zero without
         // reaching EOF. Reclamation or growth may change all the bounds below.
@@ -774,6 +779,7 @@ impl Buffer {
     // Prepare append space for one read, growing for long frames or recovering
     // space for another batch. write_buf exposes the resulting tail to Read.
     #[inline]
+    #[hotpath::measure(impl_type = "Buffer")]
     fn make_room(&mut self) {
         if self.is_empty() {
             // All input was consumed; resetting the counts recovers that space
