@@ -1,46 +1,36 @@
 //! Reusable byte buffering and storage management.
 
+// Examples retain the intended public import path. While this module is private,
+// their code is checked by the example_* unit tests instead of external doctests.
+
 #[cfg(feature = "nightly")]
 use std::io::BorrowedBuf;
 use std::io::{self, Read};
-use std::mem;
 use std::ops::{Bound, Index, RangeBounds};
 use std::{ptr, slice};
 
 use bytes::{Buf, Bytes, BytesMut};
 
-/// A byte buffer that reuses space after its data has been consumed.
+/// A growable byte buffer with space for incoming data.
 ///
-/// Borrow selected bytes without copying them, or split off owned bytes.
-/// Consumed space can be reused for subsequent input.
+/// Add data with [`extend_from_slice`](Self::extend_from_slice), or read it
+/// from a source with [`read_from`](Self::read_from). Once you have processed
+/// some data, consume it so the space can be reused.
 ///
-/// # Storage
+/// Use [`take_view`](Self::take_view) to borrow a slice, or
+/// [`take_bytes`](Self::take_bytes) to keep an owned `BytesMut`. Both let you
+/// choose how much input to consume. To discard data without returning it,
+/// use [`consume`](Self::consume).
 ///
-/// The current `BytesMut` view is divided into four regions:
-///
-/// ```text
-/// +----------+----------+-----------+----------------+
-/// | consumed | buffered | spare_len | spare_capacity |
-/// +----------+----------+-----------+----------------+
-///            | buffer() |
-///                       |          spare()           |
-/// |            buf.len()            |
-/// |                 buf.capacity()                   |
-/// ```
-///
-/// `consumed` counts bytes already consumed, and `buffered` counts the bytes
-/// returned by [`buffer`](Self::buffer). `spare_len` is initialized space
-/// after those bytes; `spare_capacity` is the remaining uninitialized capacity.
-/// Together, the last two regions make up [`spare`](Self::spare).
-///
-/// This view excludes storage held by previously split results.
+/// Adding data can allocate or copy existing bytes to make room. The initial
+/// capacity is not a limit on how much data the buffer can hold.
 ///
 /// # Examples
 ///
-/// ```text
-/// use crate::read::buffer::Buffer;
+/// ```ignore
+/// use bytesreader::BytesBuf;
 ///
-/// let mut buffer = Buffer::with_capacity(8);
+/// let mut buffer = BytesBuf::with_capacity(8);
 /// buffer.extend_from_slice(b"abcdef");
 ///
 /// let view = buffer.take_view(..4, None);
@@ -52,62 +42,108 @@ use bytes::{Buf, Bytes, BytesMut};
 /// assert_eq!(buffer.capacity(), 8);
 /// ```
 //
-// Space accounting within the current view: consumed | buffered | spare.
+// The current BytesMut view is divided into four regions:
+//
+// +----------+-----------+-----------+----------------+
+// | consumed | remaining | spare_len | spare_capacity |
+// +----------+-----------+-----------+----------------+
+//            | buffer()  |
+// |       filled()       |
+//                        |          spare()           |
+// |             buf.len()            |
+// |                  buf.capacity()                   |
+//
+// consumed counts bytes already consumed; remaining counts the bytes returned
+// by buffer(). spare_len is initialized space after those bytes, and
+// spare_capacity is the remaining uninitialized capacity. The last two
+// regions together form spare().
+//
 // BytesMut owns the accounting for storage outside this view. Even after a
 // reallocation it can retain a prefix offset, so capacity() need not describe
 // the whole allocation.
 //
-// Between operations, consumed + buffered <= buf.len() <= buf.capacity().
+// Between operations, consumed + remaining <= buf.len() <= buf.capacity().
 // buf.len() includes the initialized portion of spare space. Raw appends
 // temporarily lower it to borrow capacity as MaybeUninit<u8>, then restore it
 // once all bytes up to the new length are initialized.
-// write_buf tracks initialized space separately from committed input. The
+// read_from tracks initialized space separately from committed input. The
 // nightly path lends spare capacity through BorrowedBuf. Errors and panics
 // never append input or leave uninitialized bytes included in buf.len().
 //
 // Split results own disjoint views that may outlive this buffer. They can clear
 // and uninitialize their storage. Reclaiming it must not expose those bytes as
-// buffered data.
+// remaining data.
 #[derive(Debug)]
-pub struct Buffer {
-    // Holds consumed and buffered bytes, plus initialized spare space.
+pub struct BytesBuf {
+    // Holds consumed and remaining bytes, plus initialized spare space.
     buf: BytesMut,
     consumed: usize,
-    buffered: usize,
+    remaining: usize,
     // Refill size retained across splitting; updated when storage is acquired
     // or grows.
     buffer_size: usize,
 }
 
-impl Default for Buffer {
+impl Default for BytesBuf {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Buffer {
+// Retain the complete API for a possible public export. BytesReader currently
+// uses only part of it; the remaining operations are exercised by unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
+impl BytesBuf {
     /// Creates an empty buffer without allocating.
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
 
-    /// Creates an empty buffer with at least `capacity` bytes of capacity. Zero
-    /// defers allocation until needed.
+    /// Creates an empty buffer with room for at least `capacity` bytes.
+    ///
+    /// A capacity of zero leaves allocation until space is needed.
     ///
     /// # Panics
     ///
-    /// Panics if the requested capacity exceeds the slice-size limit.
+    /// Panics if the requested capacity exceeds `isize::MAX` bytes.
     #[inline]
-    #[hotpath::measure(impl_type = "Buffer")]
+    #[hotpath::measure(impl_type = "BytesBuf")]
     pub fn with_capacity(capacity: usize) -> Self {
         let buf = BytesMut::with_capacity(capacity);
         Self {
             buffer_size: buf.capacity(),
             buf,
             consumed: 0,
-            buffered: 0,
+            remaining: 0,
         }
+    }
+
+    /// Tries to create an empty buffer with room for at least `capacity` bytes.
+    ///
+    /// A capacity of zero does not allocate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::OutOfMemory`] if `capacity` is too large or
+    /// allocation fails.
+    pub fn try_with_capacity(capacity: usize) -> io::Result<Self> {
+        let mut storage = Vec::<u8>::new();
+        storage
+            .try_reserve_exact(capacity)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        // bytes 1.12 implements this through Vec::from_iter followed by its
+        // internal from_vec. Vec's unadvanced IntoIter reuses the allocation,
+        // including for an empty Vec, so no initialization or second allocation
+        // is needed. The constructor tests check capacity and allocation count
+        // to catch changes to that behavior in bytes or the standard library.
+        let buf = BytesMut::from_iter(storage);
+        Ok(Self {
+            buffer_size: buf.capacity(),
+            buf,
+            consumed: 0,
+            remaining: 0,
+        })
     }
 
     /// Returns the buffer's capacity in bytes, including consumed space.
@@ -120,71 +156,59 @@ impl Buffer {
         self.buf.capacity()
     }
 
-    /// Returns the number of bytes in the buffer.
-    ///
-    /// Bytes removed by [`consume`](Self::consume) are not included.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.buffered
-    }
-
-    /// Returns `true` if the buffer has no bytes.
+    /// Returns `true` if no bytes remain to be read.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.buffered == 0
+        self.remaining == 0
     }
 
-    /// Returns the number of consumed bytes before the data returned by
-    /// [`buffer`](Self::buffer).
+    /// Returns the number of consumed bytes still held in the buffer.
     ///
-    /// This describes the current buffer, not the total number of bytes
-    /// consumed over its lifetime.
+    /// These bytes can be restored with [`unconsume`](Self::unconsume).
+    /// Discarding consumed bytes reduces this count.
     #[inline]
     pub fn consumed(&self) -> usize {
         self.consumed
     }
 
-    /// Returns the number of buffered bytes waiting to be processed.
+    /// Returns the number of bytes available to read or take from the buffer.
     #[inline]
-    pub fn buffered(&self) -> usize {
-        self.buffered
+    pub fn remaining(&self) -> usize {
+        self.remaining
     }
 
-    /// Returns the number of bytes available for appending without reserving
-    /// space.
+    /// Returns the number of data bytes in the buffer, including consumed bytes.
+    ///
+    /// For example, appending six bytes and consuming two leaves `filled()`
+    /// at six and [`remaining`](Self::remaining) at four.
+    ///
+    /// Consuming data does not change this count. Discarding consumed bytes
+    /// or splitting off data reduces it; appending data increases it.
+    #[inline]
+    pub fn filled(&self) -> usize {
+        // SAFETY: both regions fit within buf.len(), so their sum cannot overflow.
+        self.consumed + self.remaining
+    }
+
+    /// Returns how many more bytes can be appended without making room first.
     ///
     /// Excludes space occupied by consumed bytes. Call
     /// [`reserve`](Self::reserve) to request more.
     #[inline]
     pub fn spare(&self) -> usize {
-        // SAFETY: consumed + buffered <= buf.len() <= capacity, so neither
+        // SAFETY: consumed + remaining <= buf.len() <= capacity, so neither
         // subtraction can underflow.
-        self.buf.capacity() - self.consumed - self.buffered
-    }
-
-    // Initialized bytes after the buffered data, available for the next read.
-    #[inline]
-    fn spare_len(&self) -> usize {
-        // SAFETY: consumed + buffered <= buf.len(), so both subtractions
-        // stay within the initialized length.
-        self.buf.len() - self.consumed - self.buffered
-    }
-
-    // Capacity beyond the initialized bytes.
-    #[inline]
-    fn spare_capacity(&self) -> usize {
-        // SAFETY: BytesMut maintains len <= capacity.
-        self.buf.capacity() - self.buf.len()
+        self.buf.capacity() - self.consumed - self.remaining
     }
 
     /// Removes all bytes from the buffer, keeping its capacity for reuse.
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::with_capacity(32);
+    /// let mut buf = BytesBuf::with_capacity(32);
     /// buf.extend_from_slice(b"hello");
     /// let capacity = buf.capacity();
     /// buf.clear();
@@ -195,17 +219,17 @@ impl Buffer {
     #[inline]
     pub fn clear(&mut self) {
         self.consumed = 0;
-        self.buffered = 0;
+        self.remaining = 0;
     }
 
-    /// Returns a slice containing the buffer's bytes.
+    /// Returns a slice of the remaining data.
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello world");
     /// buf.consume(6);
     ///
@@ -213,27 +237,29 @@ impl Buffer {
     /// ```
     #[inline]
     pub fn buffer(&self) -> &[u8] {
-        // SAFETY: consumed + buffered <= buf.len() places these buffered
+        // SAFETY: consumed + remaining <= buf.len() places these remaining
         // bytes within initialized buf. BytesMut supplies a non-null
         // pointer even for an empty view; u8 requires only byte alignment.
         // Borrowing self ties the result to the owner and prevents mutation.
-        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(self.consumed), self.len()) }
+        unsafe { slice::from_raw_parts(self.buf.as_ptr().add(self.consumed), self.remaining()) }
     }
 
-    /// Returns `range` as independently owned bytes, consuming the first
-    /// `consume` bytes or, with `None`, everything through the range's end.
+    /// Returns `range` as an owned [`BytesMut`] and consumes a prefix of the buffer.
     ///
-    /// Allocates and copies the selection if it overlaps data retained in the
-    /// buffer. Otherwise, splits off the selection without copying its bytes;
-    /// splitting may still allocate. All indices refer to the buffer before
-    /// this call.
+    /// Pass `None` to consume through the end of the range, or `Some(n)` to
+    /// consume exactly `n` bytes.
+    ///
+    /// If any selected bytes must stay in the buffer, copies the selection
+    /// into new storage. Otherwise, splits off the selection without copying
+    /// its bytes. Splitting may still allocate. All indices refer to the
+    /// buffer before this call.
     ///
     /// # Panics
     ///
-    /// Panics if the range or consumption is out of bounds, without consuming
-    /// any bytes.
+    /// Panics if the range is invalid or you ask to consume more bytes than remain.
+    /// No bytes are consumed in either case.
     #[inline(always)]
-    #[hotpath::measure(impl_type = "Buffer")]
+    #[hotpath::measure(impl_type = "BytesBuf")]
     pub fn take_bytes(
         &mut self,
         range: impl RangeBounds<usize>,
@@ -245,7 +271,7 @@ impl Buffer {
                 let end = match range.end_bound() {
                     Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
                     Bound::Excluded(&end) => end,
-                    Bound::Unbounded => self.len(),
+                    Bound::Unbounded => self.remaining(),
                 };
                 let range = (range.start_bound().cloned(), Bound::Excluded(end));
                 match consume.checked_sub(end) {
@@ -264,22 +290,21 @@ impl Buffer {
     /// Returns the bytes in `range` as a [`BytesMut`], consuming everything
     /// through the end of that range and another `addition` bytes after it.
     ///
-    /// For `start..end`, the result contains the original bytes `[start, end)`,
-    /// and the buffer keeps the bytes from `end + addition` onwards. Bytes
-    /// before `start` and the `addition` bytes are discarded. All indices are
-    /// relative to the buffered data before this call.
+    /// For example, `split_bytes(1..4, 1)` returns `abc` from `<abc>tail`
+    /// and leaves `tail`. All indices refer to [`buffer`](Self::buffer)
+    /// before the call.
     ///
     /// May allocate, but does not copy the bytes. The returned bytes can be
     /// modified independently and remain valid after the buffer is dropped.
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"<hello>tail");
-    /// let bytes = buf.split_bytes(1..6, 1);
+    /// let bytes = buf.take_bytes(1..6, Some(7));
     ///
     /// assert_eq!(&bytes[..], b"hello");
     /// assert_eq!(buf.buffer(), b"tail");
@@ -288,13 +313,13 @@ impl Buffer {
     /// # Panics
     ///
     /// Panics if `range` is invalid or its end plus `addition` exceeds
-    /// `self.len()`. The buffer is unchanged in either case.
+    /// `self.remaining()`. The buffer is unchanged in either case.
     // Inline so constant frame bounds can eliminate unused range-handling
     // branches.
     #[inline(always)]
-    #[hotpath::measure(impl_type = "Buffer")]
+    #[hotpath::measure(impl_type = "BytesBuf")]
     fn split_bytes(&mut self, range: impl RangeBounds<usize>, addition: usize) -> BytesMut {
-        let len = self.len();
+        let len = self.remaining();
         let end = match range.end_bound() {
             Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
             Bound::Excluded(&end) => end,
@@ -307,19 +332,22 @@ impl Buffer {
         };
         assert!(start <= end && end <= len, "bytes range out of bounds");
         // SAFETY: end <= len makes len - end valid. Checking addition against
-        // that remainder bounds end + addition by buffered without overflow.
-        assert!(addition <= len - end, "cannot consume past buffered input");
+        // that remainder bounds end + addition by remaining without overflow.
+        assert!(
+            addition <= len - end,
+            "cannot consume more bytes than remain"
+        );
         // Split before discarding prefixes: promoting BytesMut to shared
         // storage can allocate. An allocation panic must leave these counts
         // consistent.
-        // SAFETY: start <= end <= buffered and consumed + buffered <=
+        // SAFETY: start <= end <= remaining and consumed + remaining <=
         // buf.len() bound both offsets by the initialized length.
         let skip = self.consumed + start;
         let mut bytes = self.buf.split_to(self.consumed + end);
-        // SAFETY: end + addition <= buffered prevents subtraction underflow.
+        // SAFETY: end + addition <= remaining prevents subtraction underflow.
         // split_to removes old consumed + end bytes; the new counts sum to
-        // old buffered - end, within the remaining initialized length.
-        self.buffered -= end + addition;
+        // old remaining - end, within the remaining initialized length.
+        self.remaining -= end + addition;
         self.consumed = addition;
         if skip != 0 {
             // The checked range puts skip within bytes. split_to has already
@@ -330,22 +358,22 @@ impl Buffer {
         bytes
     }
 
-    /// Returns a slice of the bytes in `range` and consumes a prefix of the
-    /// buffer. `None` consumes through the range's end; `Some(n)` consumes
-    /// exactly `n` bytes, including zero to retain all input.
+    /// Returns the bytes in `range` as a slice and consumes a prefix of the buffer.
     ///
-    /// Both arguments refer to the buffered data before this call. The returned
-    /// slice can overlap the bytes remaining in the buffer.
+    /// Pass `None` to consume through the end of the range, or `Some(n)` to
+    /// consume exactly `n` bytes. `Some(0)` keeps all input in the buffer.
     ///
-    /// No bytes are copied. The slice borrows the buffer, so it must no longer
-    /// be used before the buffer can be modified again.
+    /// Both arguments refer to [`buffer`](Self::buffer) before the call.
+    /// The slice can include bytes that remain in the buffer.
+    ///
+    /// No bytes are copied. Finish using the slice before modifying the buffer.
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello world");
     /// let view = buf.take_view(6..11, Some(6));
     ///
@@ -355,10 +383,10 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `range` is invalid or the requested consumption exceeds the
-    /// buffer's length. The buffer is unchanged in either case.
+    /// Panics if the range is invalid or you ask to consume more bytes than remain.
+    /// No bytes are consumed in either case.
     #[inline(always)]
-    #[hotpath::measure(impl_type = "Buffer")]
+    #[hotpath::measure(impl_type = "BytesBuf")]
     pub fn take_view(&mut self, range: impl RangeBounds<usize>, consume: Option<usize>) -> &[u8] {
         // Dispatch before range handling. Combining the two paths regressed some
         // small-Item file benchmarks with explicit consumption. Keep the private
@@ -371,7 +399,7 @@ impl Buffer {
 
     #[inline]
     fn take_view_with_consume(&mut self, range: impl RangeBounds<usize>, consume: usize) -> &[u8] {
-        let len = self.len();
+        let len = self.remaining();
         let end = match range.end_bound() {
             Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
             Bound::Excluded(&end) => end,
@@ -383,14 +411,14 @@ impl Buffer {
             Bound::Unbounded => 0,
         };
         assert!(start <= end && end <= len, "view range out of bounds");
-        assert!(consume <= len, "cannot consume view past buffered input");
-        // SAFETY: start and consume are at most buffered. Adding either to
+        assert!(consume <= len, "cannot consume more bytes than remain");
+        // SAFETY: start and consume are at most remaining. Adding either to
         // consumed is bounded by buf.len(); subtracting consume cannot
-        // underflow. The updates preserve consumed + buffered.
+        // underflow. The updates preserve consumed + remaining.
         let offset = self.consumed + start;
         self.consumed += consume;
-        self.buffered -= consume;
-        // SAFETY: the checked range lies within the previously buffered data.
+        self.remaining -= consume;
+        // SAFETY: the checked range lies within the previously remaining data.
         // start <= end makes end - start valid, and offset + (end - start)
         // is at most buf.len(). Consuming changes only the counts, so those
         // initialized bytes remain in place. BytesMut provides a non-null,
@@ -401,7 +429,7 @@ impl Buffer {
 
     #[inline]
     fn take_view_with_none(&mut self, range: impl RangeBounds<usize>) -> &[u8] {
-        let len = self.len();
+        let len = self.remaining();
         let end = match range.end_bound() {
             Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
             Bound::Excluded(&end) => end,
@@ -413,14 +441,13 @@ impl Buffer {
             Bound::Unbounded => 0,
         };
         assert!(start <= end && end <= len, "view range out of bounds");
-        // SAFETY: addition <= len - end gives end + addition <= buffered,
-        // so consume cannot overflow. start and consume are at most buffered;
-        // adding either to consumed is bounded by buf.len(), and subtracting
-        // consume cannot underflow. The updates preserve consumed + buffered.
+        // SAFETY: start <= end <= remaining bounds consumed + start and
+        // consumed + end by buf.len(), so neither addition can overflow.
+        // Subtracting end cannot underflow; the sum of the counts is unchanged.
         let offset = self.consumed + start;
         self.consumed += end;
-        self.buffered -= end;
-        // SAFETY: the checked range lies within the previously buffered data.
+        self.remaining -= end;
+        // SAFETY: the checked range lies within the previously remaining data.
         // start <= end makes end - start valid, and offset + (end - start)
         // is at most buf.len(). Consuming changes only the counts, so those
         // initialized bytes remain in place. BytesMut provides a non-null,
@@ -433,10 +460,10 @@ impl Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello world");
     /// buf.consume(6);
     /// assert_eq!(buf.buffer(), b"world");
@@ -447,28 +474,102 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `amt > self.len()`.
+    /// Panics if fewer than `amt` bytes remain.
     #[inline]
     pub fn consume(&mut self, amt: usize) {
         if amt > 0 {
-            assert!(amt <= self.buffered, "cannot consume past buffered input");
-            // SAFETY: amt <= buffered bounds consumed + amt by buf.len() and
+            assert!(
+                amt <= self.remaining,
+                "cannot consume more bytes than remain"
+            );
+            // SAFETY: amt <= remaining bounds consumed + amt by buf.len() and
             // prevents subtraction underflow. The sum of the counts is unchanged.
             self.consumed += amt;
-            self.buffered -= amt;
+            self.remaining -= amt;
         }
     }
 
-    /// Discards consumed space.
+    /// Calls `visitor` with the first `amt` bytes, then consumes them and
+    /// returns `true`.
     ///
-    /// May copy buffered bytes to make that space available for appending.
+    /// If fewer than `amt` bytes remain, returns `false` without calling
+    /// `visitor` or consuming data. If `amt` is zero, calls `visitor` with an
+    /// empty slice.
+    /// The slice is borrowed without allocating or copying data.
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::with_capacity(16);
+    /// let mut buf = BytesBuf::new();
+    /// buf.extend_from_slice(b"abc");
+    /// let mut prefix = [0; 2];
+    /// assert!(buf.consume_with(2, |bytes| prefix.copy_from_slice(bytes)));
+    /// assert_eq!(&prefix, b"ab");
+    /// assert_eq!(buf.buffer(), b"c");
+    /// assert!(!buf.consume_with(2, |_| unreachable!()));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `visitor` panics, no bytes are consumed.
+    #[inline]
+    pub fn consume_with(&mut self, amt: usize, visitor: impl FnOnce(&[u8])) -> bool {
+        if let Some(claimed) = self.buffer().get(..amt) {
+            visitor(claimed);
+            // SAFETY: get succeeded, so amt <= remaining. Adding amt to consumed
+            // and subtracting it from remaining preserves their sum <= buf.len().
+            self.consumed += amt;
+            self.remaining -= amt;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Makes the last `amt` consumed bytes available for reading again.
+    ///
+    /// Only bytes counted by [`consumed`](Self::consumed) can be restored.
+    /// Operations such as [`compact`](Self::compact) can discard those bytes.
+    /// Does not allocate or copy data.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
+    ///
+    /// let mut buf = BytesBuf::new();
+    /// buf.extend_from_slice(b"abc");
+    /// buf.consume(2);
+    /// buf.unconsume(1);
+    /// assert_eq!(buf.buffer(), b"bc");
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `amt` exceeds [`consumed`](Self::consumed), without changing
+    /// the buffer.
+    #[inline]
+    pub fn unconsume(&mut self, amt: usize) {
+        assert!(amt <= self.consumed, "cannot restore discarded input");
+        // SAFETY: amt <= consumed prevents subtraction underflow. Adding amt
+        // to remaining keeps consumed + remaining unchanged and <= buf.len(),
+        // so only initialized bytes already owned by this view are restored.
+        self.consumed -= amt;
+        self.remaining += amt;
+    }
+
+    /// Reclaims the space occupied by consumed bytes.
+    ///
+    /// May copy remaining bytes to make that space available for appending.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
+    ///
+    /// let mut buf = BytesBuf::with_capacity(16);
     /// buf.extend_from_slice(b"hello world");
     /// buf.consume(6);
     /// assert_eq!(buf.spare(), 5);
@@ -483,30 +584,30 @@ impl Buffer {
         if self.is_empty() {
             self.clear();
         } else if self.consumed != 0 {
-            // SAFETY: consumed + buffered <= buf.len() bounds the source end
-            // without overflow; the destination ends at buffered <= buf.len().
+            // SAFETY: consumed + remaining <= buf.len() bounds the source end
+            // without overflow; the destination ends at remaining <= buf.len().
             // Source and destination overlap when less than half the data
             // has been consumed. copy_within supports that overlap.
             self.buf
-                .copy_within(self.consumed..(self.consumed + self.buffered), 0);
+                .copy_within(self.consumed..(self.consumed + self.remaining), 0);
             self.consumed = 0;
         }
     }
 
     /// Reserves space to append at least `additional` more bytes.
     ///
-    /// More space may be reserved than requested. Automatically discards
-    /// consumed bytes when necessary.
+    /// May reserve more space than requested and discard consumed bytes
+    /// when needed.
     ///
     /// If enough space is already available, this does not allocate or copy.
     /// Otherwise, it may allocate and copy existing bytes.
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"old:hello");
     /// buf.consume(4);
     /// buf.reserve(64);
@@ -519,7 +620,7 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if the required capacity exceeds the slice-size limit. Consumed
+    /// Panics if the required capacity exceeds `isize::MAX` bytes. Consumed
     /// bytes may have been discarded before the panic.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
@@ -529,12 +630,10 @@ impl Buffer {
     /// Tries to make room for at least `additional` more bytes using existing
     /// storage.
     ///
-    /// Returns `true` if enough space is available after the attempt. Returns
-    /// `false` if the attempt does not provide enough space. Use
-    /// [`reserve`](Self::reserve) if space must be provided.
+    /// Returns whether enough space is available after the attempt. Use
+    /// [`reserve`](Self::reserve) to allow allocation when more storage is needed.
     ///
-    /// Automatically discards consumed bytes when necessary, even if the
-    /// attempt returns `false`.
+    /// May discard consumed bytes even when it returns `false`.
     ///
     /// May copy existing bytes. Does not allocate new byte storage, although
     /// discarding consumed bytes can itself allocate on large buffers.
@@ -544,10 +643,10 @@ impl Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::with_capacity(8);
+    /// let mut buf = BytesBuf::with_capacity(8);
     /// buf.extend_from_slice(b"abcdefgh");
     /// buf.consume(4);
     ///
@@ -573,8 +672,8 @@ impl Buffer {
         // Compact only if it supplies the whole request and moves no more
         // bytes than have been consumed. This prevents repeated small appends
         // from copying the same large remainder on every reservation.
-        // SAFETY: spare + consumed == capacity - buffered <= capacity.
-        if additional <= self.spare() + self.consumed && self.consumed >= self.buffered {
+        // SAFETY: spare + consumed == capacity - remaining <= capacity.
+        if additional <= self.spare() + self.consumed && self.consumed >= self.remaining {
             self.compact();
             return true;
         }
@@ -595,10 +694,10 @@ impl Buffer {
         // requested append space.
         // This also discards initialization tracking for the tail.
         //
-        // SAFETY: advancing past consumed bytes leaves the initialized buffered
-        // bytes at the start of buf. buffered <= buf.len() <= buf.capacity(),
+        // SAFETY: advancing past consumed bytes leaves the initialized remaining
+        // bytes at the start of buf. remaining <= buf.len() <= buf.capacity(),
         // so this only shortens the length and exposes no new bytes.
-        unsafe { self.buf.set_len(self.buffered) };
+        unsafe { self.buf.set_len(self.remaining) };
         if allocate {
             self.buf.reserve(additional);
             self.buffer_size = self.buffer_size.max(self.capacity());
@@ -614,38 +713,6 @@ impl Buffer {
         }
     }
 
-    /// Copies buffered bytes into new storage with room for `additional` more
-    /// bytes and returns the previous storage.
-    ///
-    /// The returned bytes include consumed bytes and initialized spare space.
-    /// Consumed bytes are discarded from the buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the required capacity exceeds the slice-size limit.
-    fn allocate(&mut self, additional: usize) -> BytesMut {
-        let len = self.len();
-        let capacity = len
-            .checked_add(additional)
-            .expect("buffer capacity overflow");
-        let mut allocated = BytesMut::with_capacity(capacity);
-        // SAFETY: capacity is at least len, and buffer() contains len
-        // initialized bytes. For nonzero len, the new allocation is disjoint
-        // from the still live source. The copy initializes the new length.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                self.buffer().as_ptr(),
-                allocated.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
-                len,
-            );
-            allocated.set_len(len);
-        }
-        self.consumed = 0;
-        self.buffered = len;
-        self.buffer_size = self.buffer_size.max(allocated.capacity());
-        mem::replace(&mut self.buf, allocated)
-    }
-
     /// Ensures at least `len` initialized bytes of append space.
     ///
     /// Fills newly initialized bytes with `val`, leaving already initialized
@@ -654,12 +721,13 @@ impl Buffer {
     /// # Panics
     ///
     /// Panics if there is not enough space for the request.
+    #[cfg(any(test, not(feature = "nightly")))]
     #[inline]
-    pub fn try_init(&mut self, val: u8, len: usize) {
+    fn try_init(&mut self, val: u8, len: usize) {
         assert!(len <= self.spare(), "insufficient append space");
-        // SAFETY: consumed + buffered <= buf.len(), and the check bounds the
+        // SAFETY: consumed + remaining <= buf.len(), and the check bounds the
         // final sum by capacity. Neither addition can overflow.
-        let end = (self.consumed + self.buffered) + len;
+        let end = self.filled() + len;
         if end > self.buf.len() {
             // SAFETY: this branch establishes end > buf.len().
             let additional = end - self.buf.len();
@@ -675,16 +743,17 @@ impl Buffer {
         }
     }
 
-    /// Appends bytes from one read and returns the number read.
+    /// Reads from the source once, appends the data, and returns the number
+    /// of bytes added.
     ///
     /// Makes room as needed before reading. The reader always receives a
     /// nonempty destination.
     ///
     /// # Errors
     ///
-    /// Returns errors from the reader, including
-    /// [`io::ErrorKind::Interrupted`], without retrying. Consumed bytes
-    /// may be discarded when making room, even if reading fails.
+    /// Returns errors from the reader, including [`io::ErrorKind::Interrupted`],
+    /// without retrying or adding data from that call. Making room can still
+    /// discard previously consumed bytes.
     ///
     /// # Panics
     ///
@@ -692,8 +761,8 @@ impl Buffer {
     /// destination can hold.
     // Inline to optimize buffer access with the concrete Read implementation.
     #[inline(always)]
-    #[hotpath::measure(impl_type = "Buffer")]
-    pub fn write_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
+    #[hotpath::measure(impl_type = "BytesBuf")]
+    pub fn read_from<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         // Always supply space: an empty destination could return zero without
         // reaching EOF. Reclamation or growth may change all the bounds below.
         self.make_room();
@@ -714,26 +783,26 @@ impl Buffer {
     #[inline(always)]
     fn write_init_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         self.try_init(0, self.spare());
-        // SAFETY: consumed + buffered <= buf.len() bounds filled and makes
+        // SAFETY: consumed + remaining <= buf.len() bounds filled and makes
         // buf.len() - filled nonnegative.
-        let filled = self.consumed + self.buffered;
+        let filled = self.filled();
         let available = self.buf.len() - filled;
-        // SAFETY: consumed + buffered <= buf.len() by the buffer invariant.
+        // SAFETY: consumed + remaining <= buf.len() by the buffer invariant.
         // try_init initialized the entire append space, so filled..buf.len()
         // is a valid initialized slice, exclusively borrowed through &mut self.
         let dst = unsafe { self.buf.get_unchecked_mut(filled..) };
         let nread = reader.read(dst)?;
 
         // Read is a safe trait: reject an invalid count before it can expose
-        // bytes outside the destination or overflow the buffered count. Panic
+        // bytes outside the destination or overflow the remaining count. Panic
         // on this contract violation, matching the standard read_buf fallback.
         assert!(
             nread <= available,
             "Read returned {nread} bytes for a buffer of {available} bytes"
         );
-        // SAFETY: nread <= buf.len() - (consumed + buffered), so the updated
-        // count cannot overflow and consumed + buffered remains <= buf.len().
-        self.buffered += nread;
+        // SAFETY: nread <= buf.len() - (consumed + remaining), so the updated
+        // count cannot overflow and consumed + remaining remains <= buf.len().
+        self.remaining += nread;
         Ok(nread)
     }
 
@@ -741,15 +810,15 @@ impl Buffer {
     #[inline(always)]
     fn write_uninit_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<usize> {
         let capacity = self.buf.capacity();
-        // SAFETY: consumed + buffered <= buf.len() <= capacity.
-        let filled = self.consumed + self.buffered;
+        // SAFETY: consumed + remaining <= buf.len() <= capacity.
+        let filled = self.filled();
         // buf.len() includes initialized spare bytes; filled ends the input.
         // Neither boundary implies that those bytes contain zeros.
         let mut dst = if self.buf.len() == capacity {
             // From<&mut [u8]> marks the destination as initialized without
             // writing to it. The default read_buf can then call read() without
             // clearing space that was initialized by an earlier operation.
-            // SAFETY: consumed + buffered <= buf.len() by the buffer invariant.
+            // SAFETY: consumed + remaining <= buf.len() by the buffer invariant.
             // The tail is initialized and exclusively borrowed through self.
             BorrowedBuf::from(unsafe { self.buf.get_unchecked_mut(filled..) })
         } else {
@@ -767,7 +836,7 @@ impl Buffer {
 
         // read_buf may advance its cursor and then return an error. Keep the
         // result until initialization has been recorded, but do not change
-        // buffered yet: an error or panic must not append that partial input.
+        // remaining yet: an error or panic must not append that partial input.
         let result = reader.read_buf(dst.unfilled());
         let nread = dst.len();
         // Remember a fully initialized tail even after a short read or error,
@@ -788,16 +857,16 @@ impl Buffer {
         result?;
         // Initialization alone does not make bytes input. Commit only the
         // bytes reported by a successful read, including zero at EOF.
-        // SAFETY: filled + nread <= len, so buffered + nread cannot overflow
-        // and the updated consumed + buffered stays within buf.len().
-        self.buffered += nread;
+        // SAFETY: filled + nread <= len, so remaining + nread cannot overflow
+        // and the updated consumed + remaining stays within buf.len().
+        self.remaining += nread;
         Ok(nread)
     }
 
     // Prepare append space for one read, growing for long frames or recovering
-    // space for another batch. write_buf exposes the resulting tail to Read.
+    // space for another batch. read_from exposes the resulting tail to Read.
     #[inline]
-    #[hotpath::measure(impl_type = "Buffer")]
+    #[hotpath::measure(impl_type = "BytesBuf")]
     fn make_room(&mut self) {
         if self.is_empty() {
             // All input was consumed; resetting the counts recovers that space
@@ -825,12 +894,12 @@ impl Buffer {
         // Keep buf.len() unchanged to retain initialized spare space. Only
         // move when the consumed prefix is at least as large as the data kept
         // and reclaiming it supplies the next read batch.
-        // SAFETY: spare + consumed == capacity - buffered <= capacity.
-        if min_spare <= self.spare() + self.consumed && self.consumed >= self.buffered {
-            // SAFETY: consumed + buffered <= buf.len() bounds the source end
+        // SAFETY: spare + consumed == capacity - remaining <= capacity.
+        if min_spare <= self.spare() + self.consumed && self.consumed >= self.remaining {
+            // SAFETY: consumed + remaining <= buf.len() bounds the source end
             // without overflow; copy_within permits overlapping ranges.
             self.buf
-                .copy_within(self.consumed..(self.consumed + self.buffered), 0);
+                .copy_within(self.consumed..(self.consumed + self.remaining), 0);
             self.consumed = 0;
             return;
         }
@@ -847,16 +916,16 @@ impl Buffer {
         // potentially forcing allocation when released space could be reused.
         // This also discards initialization tracking for the tail.
         //
-        // SAFETY: consumed bytes have been removed, so 0..buffered contains the
-        // initialized data. buffered <= buf.len() <= buf.capacity(), making
+        // SAFETY: consumed bytes have been removed, so 0..remaining contains the
+        // initialized data. remaining <= buf.len() <= buf.capacity(), making
         // this a length reduction that exposes no new bytes.
         debug_assert_eq!(self.consumed, 0);
-        unsafe { self.buf.set_len(self.buffered) };
+        unsafe { self.buf.set_len(self.remaining) };
 
         // Double the recorded capacity for a long frame. Otherwise, ask only
         // for the normal batch so BytesMut can reclaim released split space
         // without growing the allocation.
-        let additional = if self.buffered > min_spare {
+        let additional = if self.remaining > min_spare {
             let cap = self.buffer_size.saturating_mul(2).min(isize::MAX as usize);
             // SAFETY: buffer_size tracks at least the current capacity, and
             // BytesMut's length is at most isize::MAX. Both bounds used to
@@ -872,22 +941,10 @@ impl Buffer {
         self.buffer_size = self.buffer_size.max(self.buf.capacity());
     }
 
-    /// Returns the buffered data, reading once from `reader` if the buffer is
-    /// empty. May allocate or copy data to make room. See
-    /// [`write_buf`](Self::write_buf) for errors.
-    #[inline]
-    pub fn fill_buf<R: ?Sized + Read>(&mut self, reader: &mut R) -> io::Result<&[u8]> {
-        if self.is_empty() {
-            self.write_buf(reader)?;
-        }
-        Ok(self.buffer())
-    }
-
     /// Splits the bytes at `at`, returning the first part.
     ///
-    /// The returned [`BytesMut`] contains the original bytes `[0, at)`, and the
-    /// buffer keeps `[at, len)`, where `len` is the buffer's length before this
-    /// call.
+    /// Returns the first `at` bytes as a [`BytesMut`], leaving the rest in
+    /// the buffer.
     ///
     /// May allocate, but does not copy the bytes. Both parts can be modified
     /// independently. The returned bytes remain valid after the buffer is
@@ -895,10 +952,10 @@ impl Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello world");
     /// let first = buf.split_to(5);
     ///
@@ -908,17 +965,17 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `at > self.len()`.
+    /// Panics if fewer than `at` bytes remain.
     #[inline]
     pub fn split_to(&mut self, at: usize) -> BytesMut {
         assert!(
-            at <= self.len(),
+            at <= self.remaining(),
             "split_to out of bounds: {:?} <= {:?}",
             at,
-            self.len(),
+            self.remaining(),
         );
         let offset = self.consumed;
-        // SAFETY: at <= buffered and consumed + buffered <= buf.len() bound
+        // SAFETY: at <= remaining and consumed + remaining <= buf.len() bound
         // offset + at by the initialized length without overflow.
         let end = offset + at;
 
@@ -929,9 +986,9 @@ impl Buffer {
             other.advance(offset);
         }
 
-        // SAFETY: at <= buffered prevents underflow. After splitting at end,
-        // buffered - at is within the remaining initialized length.
-        self.buffered -= at;
+        // SAFETY: at <= remaining prevents underflow. After splitting at end,
+        // remaining - at is within the remaining initialized length.
+        self.remaining -= at;
         self.consumed = 0;
 
         other
@@ -939,9 +996,8 @@ impl Buffer {
 
     /// Splits the bytes at `at`, returning the second part.
     ///
-    /// The buffer keeps the original bytes `[0, at)`, and the returned
-    /// [`BytesMut`] contains `[at, len)`, where `len` is the buffer's length
-    /// before this call.
+    /// Keeps the first `at` bytes in the buffer and returns the rest as a
+    /// [`BytesMut`].
     ///
     /// May allocate, but does not copy the bytes. Both parts can be modified
     /// independently. The returned bytes remain valid after the buffer is
@@ -949,10 +1005,10 @@ impl Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello world");
     /// let second = buf.split_off(5);
     ///
@@ -962,23 +1018,23 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `at > self.len()`.
+    /// Panics if fewer than `at` bytes remain.
     #[inline]
     pub fn split_off(&mut self, at: usize) -> BytesMut {
         assert!(
-            at <= self.len(),
+            at <= self.remaining(),
             "split_off out of bounds: {:?} <= {:?}",
             at,
-            self.len(),
+            self.remaining(),
         );
 
-        // SAFETY: at <= buffered bounds consumed + at by buf.len() and makes
-        // buffered - at nonnegative. The returned view contains that many
+        // SAFETY: at <= remaining bounds consumed + at by buf.len() and makes
+        // remaining - at nonnegative. The returned view contains that many
         // initialized bytes after split.
         let split = self.consumed + at;
         let mut other = self.buf.split_off(split);
-        other.truncate(self.buffered - at);
-        self.buffered = at;
+        other.truncate(self.remaining - at);
+        self.remaining = at;
         other
     }
 
@@ -988,10 +1044,10 @@ impl Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello");
     /// buf.extend_from_slice(b" world");
     ///
@@ -1000,16 +1056,16 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if the required capacity exceeds the slice-size limit.
+    /// Panics if the required capacity exceeds `isize::MAX` bytes.
     #[inline]
     pub fn extend_from_slice(&mut self, extend: &[u8]) {
         let cnt = extend.len();
         self.reserve(cnt);
         let len = self.buf.len();
-        // SAFETY: consumed + buffered <= buf.len(). reserve guarantees cnt
-        // bytes after filled, so filled + cnt and buffered + cnt cannot
+        // SAFETY: consumed + remaining <= buf.len(). reserve guarantees cnt
+        // bytes after filled, so filled + cnt and remaining + cnt cannot
         // overflow and the updated counts fit the initialized length below.
-        let filled = self.consumed + self.buffered;
+        let filled = self.filled();
 
         // SAFETY: reserve guarantees filled + cnt <= capacity. extend is a
         // valid &[u8] containing cnt readable bytes. It cannot borrow this
@@ -1031,7 +1087,7 @@ impl Buffer {
             ptr::copy_nonoverlapping(extend.as_ptr(), dst.add(filled), cnt);
             self.buf.set_len(len.max(filled + cnt));
         }
-        self.buffered += cnt;
+        self.remaining += cnt;
     }
 
     /// Copies the bytes in `range` and appends them to the end of the buffer.
@@ -1041,10 +1097,10 @@ impl Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
-    /// use crate::read::buffer::Buffer;
+    /// ```ignore
+    /// use bytesreader::BytesBuf;
     ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"old:abc");
     /// buf.consume(4);
     /// buf.extend_from_within(1..3);
@@ -1054,8 +1110,8 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `range` is invalid or the required capacity exceeds the
-    /// slice-size limit.
+    /// Panics if `range` is invalid or the required capacity exceeds
+    /// `isize::MAX` bytes.
     #[inline]
     pub fn extend_from_within(&mut self, range: impl RangeBounds<usize>) {
         let start = match range.start_bound() {
@@ -1067,19 +1123,19 @@ impl Buffer {
             .buffer()
             .index((Bound::Included(start), range.end_bound().cloned()));
         // Keep offsets, not pointers, across reserve: it can move
-        // the buffered input or replace the allocation.
+        // the remaining input or replace the allocation.
         let cnt = extend.len();
         self.reserve(cnt);
         let len = self.buf.len();
-        // SAFETY: the checked range gives start + cnt <= buffered. reserve
-        // preserves buffered and provides cnt spare bytes, bounding all source
+        // SAFETY: the checked range gives start + cnt <= remaining. reserve
+        // preserves remaining and provides cnt spare bytes, bounding all source
         // and destination sums below by the current capacity.
         let src_start = self.consumed + start;
-        let dst_start = self.consumed + self.buffered;
+        let dst_start = self.filled();
 
         // SAFETY: indexing input with the bounds tuple checks the range and
-        // returns a subslice, so start + cnt <= buffered.
-        // reserve preserves buffered data and its length, although it may move
+        // returns a subslice, so start + cnt <= remaining.
+        // reserve preserves remaining data and its length, although it may move
         // the data, so offsets are computed using the updated consumed value.
         // Source:      consumed+start .. consumed+start+cnt
         // Destination: dst_start .. dst_start+cnt
@@ -1095,26 +1151,26 @@ impl Buffer {
             ptr::copy_nonoverlapping(ptr.add(src_start), ptr.add(dst_start), cnt);
             self.buf.set_len(len.max(dst_start + cnt));
         }
-        self.buffered += cnt;
+        self.remaining += cnt;
     }
 }
 
-impl Buf for Buffer {
+impl Buf for BytesBuf {
     #[inline]
     fn advance(&mut self, cnt: usize) {
         assert!(
             cnt <= self.remaining(),
-            "cannot advance past remaining input"
+            "cannot advance more bytes than remain"
         );
-        // SAFETY: cnt <= buffered bounds consumed + cnt by buf.len() and
+        // SAFETY: cnt <= remaining bounds consumed + cnt by buf.len() and
         // prevents subtraction underflow. The sum of the counts is unchanged.
         self.consumed += cnt;
-        self.buffered -= cnt;
+        self.remaining -= cnt;
     }
 
     #[inline]
     fn remaining(&self) -> usize {
-        self.len()
+        self.remaining
     }
 
     #[inline]
@@ -1122,8 +1178,7 @@ impl Buf for Buffer {
         self.buffer()
     }
 
-    /// Returns the first `len` bytes as an immutable [`Bytes`], removing them
-    /// from the buffer.
+    /// Returns the first `len` bytes as [`Bytes`] and removes them from the buffer.
     ///
     /// The buffer keeps the bytes from `len` onwards. May allocate, but does
     /// not copy the bytes. The result remains valid after the buffer is
@@ -1132,12 +1187,11 @@ impl Buf for Buffer {
     ///
     /// # Examples
     ///
-    /// ```text
+    /// ```ignore
     /// use bytes::Buf;
+    /// use bytesreader::BytesBuf;
     ///
-    /// use crate::read::buffer::Buffer;
-    ///
-    /// let mut buf = Buffer::new();
+    /// let mut buf = BytesBuf::new();
     /// buf.extend_from_slice(b"hello world");
     /// let bytes = buf.copy_to_bytes(5);
     ///
@@ -1147,7 +1201,7 @@ impl Buf for Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `len > self.len()`.
+    /// Panics if fewer than `len` bytes remain.
     #[inline]
     fn copy_to_bytes(&mut self, len: usize) -> Bytes {
         if len == 0 {
@@ -1160,24 +1214,85 @@ impl Buf for Buffer {
 #[cfg(test)]
 mod test {
     use std::io::{self, Read};
-    use std::mem::MaybeUninit;
+    use std::mem::{self, MaybeUninit};
     use std::ops::Bound::{Excluded, Included, Unbounded};
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
 
     use bytes::{Buf, BytesMut};
 
-    use super::Buffer;
+    use super::BytesBuf;
     use crate::test::allocations;
 
-    fn segments(buffer: &Buffer) -> [usize; 3] {
-        let parts = [buffer.consumed(), buffer.buffered(), buffer.spare()];
+    impl BytesBuf {
+        // Initialized bytes after the remaining data, available for the next read.
+        #[inline]
+        fn spare_len(&self) -> usize {
+            // SAFETY: consumed + remaining <= buf.len(), so both subtractions
+            // stay within the initialized length.
+            self.buf.len() - self.consumed - self.remaining
+        }
+
+        /// Copies remaining bytes into new storage with room for `additional` more
+        /// bytes and returns the previous storage.
+        ///
+        /// The returned bytes include consumed bytes and initialized spare space.
+        /// Consumed bytes are discarded from the buffer.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the required capacity exceeds `isize::MAX` bytes.
+        fn allocate(&mut self, additional: usize) -> BytesMut {
+            let len = self.remaining();
+            let capacity = len
+                .checked_add(additional)
+                .expect("buffer capacity overflow");
+            let mut allocated = BytesMut::with_capacity(capacity);
+            // SAFETY: capacity is at least len, and buffer() contains len
+            // initialized bytes. For nonzero len, the new allocation is disjoint
+            // from the still live source. The copy initializes the new length.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.buffer().as_ptr(),
+                    allocated.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                    len,
+                );
+                allocated.set_len(len);
+            }
+            self.consumed = 0;
+            self.remaining = len;
+            self.buffer_size = self.buffer_size.max(allocated.capacity());
+            mem::replace(&mut self.buf, allocated)
+        }
+    }
+
+    fn segments(buffer: &BytesBuf) -> [usize; 3] {
+        let parts = [buffer.consumed(), buffer.remaining(), buffer.spare()];
         assert_eq!(parts.iter().sum::<usize>(), buffer.capacity());
         parts
     }
 
     #[test]
+    fn try_with_capacity_supports_empty_storage_and_reports_oversized_requests() {
+        for capacity in [0, 32] {
+            let (mut buffer, count) =
+                allocations(|| BytesBuf::try_with_capacity(capacity).unwrap());
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.filled(), 0);
+            assert!(buffer.capacity() >= capacity);
+            assert_eq!(count, usize::from(capacity != 0));
+            buffer.extend_from_slice(b"hello");
+            assert_eq!(buffer.buffer(), b"hello");
+        }
+        assert_eq!(
+            BytesBuf::try_with_capacity(usize::MAX).unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory,
+        );
+    }
+
+    #[test]
     fn make_room_prepares_zero_capacity_and_grows_full_buffers() {
-        let mut buffer = Buffer::new();
+        let mut buffer = BytesBuf::new();
         buffer.make_room();
         assert!(buffer.spare() > 0);
         assert_eq!(buffer.spare_len(), 0);
@@ -1195,7 +1310,7 @@ mod test {
 
     #[test]
     fn make_room_reuses_consumed_space_after_splitting() {
-        let mut buffer = Buffer::with_capacity(8);
+        let mut buffer = BytesBuf::with_capacity(8);
         buffer.extend_from_slice(b"abcdefgh");
         let address = buffer.buf.as_ptr();
         buffer.consume(4);
@@ -1217,7 +1332,7 @@ mod test {
 
     #[test]
     fn make_room_recovers_released_split_space() {
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[b'x'; 64]);
         let address = buffer.buf.as_ptr();
         drop(buffer.split_off(8));
@@ -1229,13 +1344,13 @@ mod test {
     }
 
     #[test]
-    fn write_buf_refills_shared_views_with_short_or_exhausted_tails() {
+    fn read_from_refills_shared_views_with_short_or_exhausted_tails() {
         for (filled, split) in [(64, 32), (63, 32), (64, 56)] {
-            let mut buffer = Buffer::with_capacity(64);
+            let mut buffer = BytesBuf::with_capacity(64);
             buffer.extend_from_slice(&vec![b'x'; filled]);
             let retained = buffer.split_to(split);
             let mut source = &[b'y'; 32][..];
-            assert_eq!(buffer.write_buf(&mut source).unwrap(), 32);
+            assert_eq!(buffer.read_from(&mut source).unwrap(), 32);
             assert!(source.is_empty());
             assert_eq!(
                 &buffer.buffer()[..filled - split],
@@ -1251,7 +1366,7 @@ mod test {
         let data: Vec<_> = (0..64).collect();
         for filled in [63, 64] {
             for (split, consumed) in [(24, 24), (32, 16), (32, 24), (40, 16)] {
-                let mut buffer = Buffer::with_capacity(64);
+                let mut buffer = BytesBuf::with_capacity(64);
                 buffer.extend_from_slice(&data[..filled]);
                 let retained = buffer.split_to(split);
                 buffer.consume(consumed);
@@ -1273,7 +1388,7 @@ mod test {
 
     #[test]
     fn make_room_grows_when_a_released_suffix_cannot_supply_a_read_batch() {
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[b'x'; 64]);
         let retained = buffer.split_to(48);
         buffer.reserve(24);
@@ -1302,19 +1417,19 @@ mod test {
     fn acquired_storage_sets_the_refill_size_after_splitting() {
         for requested in [8, 128] {
             for allocate in [false, true] {
-                let mut buffer = Buffer::new();
+                let mut buffer = BytesBuf::new();
                 if allocate {
                     drop(buffer.allocate(requested));
                 } else {
                     buffer.reserve(requested);
                 }
                 let capacity = buffer.capacity();
-                buffer.extend_from_slice(&vec![b'x'; capacity - 1 - buffer.len()]);
-                let retained = buffer.split_to(buffer.len());
+                buffer.extend_from_slice(&vec![b'x'; capacity - 1 - buffer.remaining()]);
+                let retained = buffer.split_to(buffer.remaining());
                 assert_eq!(buffer.capacity(), 1);
                 let batch = vec![b'y'; capacity.div_ceil(2)];
                 assert_eq!(
-                    buffer.write_buf(&mut batch.as_slice()).unwrap(),
+                    buffer.read_from(&mut batch.as_slice()).unwrap(),
                     batch.len()
                 );
                 assert_eq!(buffer.buffer_size, capacity);
@@ -1325,8 +1440,8 @@ mod test {
     }
 
     #[test]
-    fn write_buf_refills_space_released_by_a_modified_split() {
-        let mut buffer = Buffer::with_capacity(64);
+    fn read_from_refills_space_released_by_a_modified_split() {
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[b'x'; 64]);
         let mut prefix = buffer.split_to(32);
         prefix.clear();
@@ -1337,7 +1452,7 @@ mod test {
         buffer.make_room();
         assert_eq!(buffer.buffer(), &[b'x'; 32]);
         assert_eq!(buffer.spare(), 32);
-        assert_eq!(buffer.write_buf(&mut &b"yy"[..]).unwrap(), 2);
+        assert_eq!(buffer.read_from(&mut &b"yy"[..]).unwrap(), 2);
         assert_eq!(&buffer.buffer()[..32], &[b'x'; 32]);
         assert_eq!(&buffer.buffer()[32..], b"yy");
         if cfg!(feature = "nightly") {
@@ -1351,7 +1466,7 @@ mod test {
 
     #[test]
     fn segments_exclude_space_transferred_by_splitting() {
-        let mut buffer = Buffer::with_capacity(32);
+        let mut buffer = BytesBuf::with_capacity(32);
         buffer.extend_from_slice(b"abcdefghijkl");
         assert_eq!(segments(&buffer), [0, 12, 20]);
         buffer.consume(2);
@@ -1378,7 +1493,7 @@ mod test {
 
     #[test]
     fn reserve_after_advancing_allows_later_prefix_recovery() {
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[0x41; 64]);
         buffer.consume(8);
         buffer.reserve(100);
@@ -1386,7 +1501,7 @@ mod test {
         let capacity = buffer.capacity();
         let address = buffer.buf.as_ptr();
         drop(buffer.split_to(48));
-        assert!(buffer.try_reclaim(capacity - buffer.len()));
+        assert!(buffer.try_reclaim(capacity - buffer.remaining()));
         assert_eq!(buffer.buf.as_ptr(), address.wrapping_sub(8));
         assert_eq!(buffer.capacity(), capacity + 8);
         assert_eq!(buffer.buffer(), &[0x41; 8]);
@@ -1395,7 +1510,7 @@ mod test {
     #[test]
     fn suffix_reclamation_increases_capacity_without_copying() {
         for reserve in [false, true] {
-            let mut buffer = Buffer::with_capacity(100);
+            let mut buffer = BytesBuf::with_capacity(100);
             buffer.extend_from_slice(&[0x41; 8]);
             let suffix = buffer.split_off(8);
             let address = buffer.buf.as_ptr();
@@ -1411,7 +1526,7 @@ mod test {
                 }
                 assert_eq!(buffer.buf.as_ptr(), address);
                 assert!(buffer.capacity() >= 8 + additional);
-                assert_eq!(buffer.capacity(), buffer.len() + buffer.spare());
+                assert_eq!(buffer.capacity(), buffer.remaining() + buffer.spare());
                 assert!(buffer.spare() >= additional);
                 let parts = segments(&buffer);
                 buffer.reserve(0);
@@ -1424,7 +1539,7 @@ mod test {
 
     #[test]
     fn released_prefix_can_be_reclaimed_after_further_splitting() {
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[0x41; 64]);
         let address = buffer.buffer().as_ptr();
         drop(buffer.split_to(48));
@@ -1442,11 +1557,11 @@ mod test {
         use std::ops::Bound::{Excluded, Included};
 
         for initialized in [false, true] {
-            let mut buffer = Buffer::with_capacity(32);
+            let mut buffer = BytesBuf::with_capacity(32);
             if initialized {
                 let spare = buffer.spare();
                 buffer.try_init(0, spare);
-                buffer.write_buf(&mut io::empty()).unwrap();
+                buffer.read_from(&mut io::empty()).unwrap();
             }
             buffer.extend_from_slice(b"old:abcdefgh");
             buffer.consume(4);
@@ -1470,9 +1585,9 @@ mod test {
     fn extraction_handles_empty_full_and_invalid_ranges() {
         use std::ops::Bound::{Excluded, Included, Unbounded};
 
-        assert!(Buffer::new().split_bytes(.., 0).is_empty());
-        assert!(Buffer::new().take_view(.., None).is_empty());
-        let mut buffer = Buffer::new();
+        assert!(BytesBuf::new().split_bytes(.., 0).is_empty());
+        assert!(BytesBuf::new().take_view(.., None).is_empty());
+        let mut buffer = BytesBuf::new();
         buffer.extend_from_slice(b"abcdef");
         assert!(buffer.split_bytes(2..2, 1).is_empty());
         assert_eq!(buffer.buffer(), b"def");
@@ -1488,12 +1603,12 @@ mod test {
             ((Unbounded, Excluded(1)), usize::MAX, Some(usize::MAX)),
             ((Unbounded, Excluded(2)), usize::MAX - 1, Some(usize::MAX)),
         ] {
-            let mut buffer = Buffer::new();
+            let mut buffer = BytesBuf::new();
             buffer.extend_from_slice(b"abcdef");
             let address = buffer.buffer().as_ptr();
             let state = (
                 buffer.consumed,
-                (buffer.consumed + buffer.buffered),
+                (buffer.consumed + buffer.remaining),
                 buffer.buf.len(),
                 buffer.capacity(),
             );
@@ -1513,7 +1628,7 @@ mod test {
                 assert_eq!(
                     (
                         buffer.consumed,
-                        buffer.consumed + buffer.buffered,
+                        buffer.consumed + buffer.remaining,
                         buffer.buf.len(),
                         buffer.capacity(),
                     ),
@@ -1527,11 +1642,11 @@ mod test {
     fn copy_to_bytes_shares_only_buffered_input_and_preserves_initialized_tail() {
         for initialized in [false, true] {
             for count in [1, 3, 6] {
-                let mut buffer = Buffer::with_capacity(16);
+                let mut buffer = BytesBuf::with_capacity(16);
                 if initialized {
                     let spare = buffer.spare();
                     buffer.try_init(0, spare);
-                    buffer.write_buf(&mut io::empty()).unwrap();
+                    buffer.read_from(&mut io::empty()).unwrap();
                 }
                 buffer.extend_from_slice(b"abcdefgh");
                 buffer.consume(2);
@@ -1558,15 +1673,15 @@ mod test {
 
     #[test]
     fn copy_to_bytes_zero_and_invalid_lengths_preserve_buffer_state() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         let spare = buffer.spare();
         buffer.try_init(0, spare);
-        buffer.write_buf(&mut &b"abcdefgh"[..]).unwrap();
+        buffer.read_from(&mut &b"abcdefgh"[..]).unwrap();
         buffer.consume(2);
         let before = (
             buffer.buffer().as_ptr(),
             buffer.consumed,
-            (buffer.consumed + buffer.buffered),
+            (buffer.consumed + buffer.remaining),
             buffer.buf.len(),
             buffer.capacity(),
         );
@@ -1579,18 +1694,18 @@ mod test {
             (
                 buffer.buffer().as_ptr(),
                 buffer.consumed,
-                (buffer.consumed + buffer.buffered),
+                (buffer.consumed + buffer.remaining),
                 buffer.buf.len(),
                 buffer.capacity(),
             ),
             before
         );
-        assert!(Buffer::new().copy_to_bytes(0).is_empty());
+        assert!(BytesBuf::new().copy_to_bytes(0).is_empty());
     }
 
     #[test]
     fn reclaim_of_an_empty_view_discards_initialized_tail() {
-        let mut slab = Buffer::with_capacity(8192);
+        let mut slab = BytesBuf::with_capacity(8192);
         slab.extend_from_slice(&vec![0xa5; 2000]);
         drop(slab.split_to(1500));
         slab.clear();
@@ -1607,7 +1722,7 @@ mod test {
 
     #[test]
     fn reserve_preserves_input_after_shared_prefix_is_uninitialized() {
-        let mut buffer = Buffer::with_capacity(128);
+        let mut buffer = BytesBuf::with_capacity(128);
         buffer.extend_from_slice(&[b'e'; 128]);
         let mut prefix = buffer.split_to(64);
         assert_eq!(buffer.capacity(), 64);
@@ -1622,38 +1737,44 @@ mod test {
         assert_eq!(buffer.buf.len(), 64);
         let spare = buffer.spare();
         buffer.try_init(0, spare);
-        buffer.write_buf(&mut &b"ij"[..]).unwrap();
+        buffer.read_from(&mut &b"ij"[..]).unwrap();
         assert_eq!(&buffer.buffer()[..64], &[b'e'; 64]);
         assert_eq!(&buffer.buffer()[64..], b"ij");
     }
 
     #[test]
     fn reserved_capacity_is_separate_from_initialized_spare() {
-        let mut buffer = Buffer::with_capacity(8);
+        let mut buffer = BytesBuf::with_capacity(8);
         buffer.extend_from_slice(b"ab");
         let spare = buffer.spare();
         buffer.try_init(0, spare);
+        assert_eq!(buffer.filled(), 2);
+        assert_eq!(buffer.remaining(), 2);
         buffer.reserve(16);
         assert_eq!(buffer.buf.len(), 2);
         assert_eq!(buffer.spare_len(), 0);
         assert!(buffer.spare() >= 16);
         buffer.try_init(0, 6);
         assert_eq!(buffer.spare_len(), 6);
-        buffer.buf[buffer.consumed + buffer.buffered..].copy_from_slice(b"cdefgh");
+        buffer.buf[buffer.consumed + buffer.remaining..].copy_from_slice(b"cdefgh");
         assert_eq!(buffer.spare_len(), 6);
         let spare = buffer.buf.spare_capacity_mut();
         // Safe callers may leave these bytes uninitialized. Neither
-        // buffered data nor the initialized tail may expose them.
+        // remaining data nor the initialized tail may expose them.
         spare.fill(MaybeUninit::uninit());
         spare[0].write(b'i');
         spare[1].write(b'j');
         assert_eq!(buffer.buffer(), b"ab");
-        assert_eq!(&buffer.buf[buffer.consumed + buffer.buffered..], b"cdefgh");
+        assert_eq!(&buffer.buf[buffer.consumed + buffer.remaining..], b"cdefgh");
         buffer.extend_from_slice(b"cdefghij");
         assert_eq!(buffer.buffer(), b"abcdefghij");
 
-        assert_eq!(buffer.write_buf(&mut &b"k"[..]).unwrap(), 1);
+        assert_eq!(buffer.read_from(&mut &b"k"[..]).unwrap(), 1);
         assert_eq!(buffer.buffer(), b"abcdefghijk");
+        buffer.consume(3);
+        assert_eq!(buffer.filled(), 11);
+        assert_eq!(buffer.remaining(), 8);
+        assert_eq!(Buf::remaining(&buffer), 8);
         if cfg!(feature = "nightly") {
             assert_eq!(buffer.buf.len(), 11);
             assert_eq!(buffer.spare_len(), 0);
@@ -1667,7 +1788,7 @@ mod test {
     fn reclamation_handles_poisoned_prefixes_with_empty_and_consumed_input() {
         for split in 1..=8 {
             for consumed in 0..=8 - split {
-                let mut buffer = Buffer::with_capacity(8);
+                let mut buffer = BytesBuf::with_capacity(8);
                 buffer.extend_from_slice(b"abcdefgh");
                 let mut prefix = buffer.split_to(split);
                 prefix.clear();
@@ -1676,14 +1797,14 @@ mod test {
                 buffer.consume(consumed);
 
                 // Reclamation may fail when moving live bytes costs too much.
-                // Either result must keep buffered input and initialized spare
+                // Either result must keep remaining input and initialized spare
                 // space valid.
                 buffer.try_reclaim(split);
                 assert_eq!(buffer.buffer(), &b"abcdefgh"[split + consumed..]);
                 // Read every initialized spare byte so Miri can check it,
-                // including when no buffered input remains to inspect.
+                // including when no input remains to inspect.
                 std::hint::black_box(
-                    buffer.buf[buffer.consumed + buffer.buffered..]
+                    buffer.buf[buffer.consumed + buffer.remaining..]
                         .iter()
                         .map(|&b| u64::from(b))
                         .sum::<u64>(),
@@ -1699,18 +1820,18 @@ mod test {
     #[test]
     fn reserve_overflow_preserves_data_after_discarding_initialized_tail() {
         for shared in [false, true] {
-            let mut buffer = Buffer::with_capacity(8);
+            let mut buffer = BytesBuf::with_capacity(8);
             buffer.extend_from_slice(b"abcdef");
             let spare = buffer.spare();
             buffer.try_init(0, spare);
-            buffer.buf[buffer.consumed + buffer.buffered..].copy_from_slice(b"XY");
+            buffer.buf[buffer.consumed + buffer.remaining..].copy_from_slice(b"XY");
             let owned = shared.then(|| buffer.split_to(1));
             buffer.consume(if shared { 1 } else { 2 });
 
             let address = buffer.buffer().as_ptr();
             assert!(catch_unwind(AssertUnwindSafe(|| buffer.reserve(usize::MAX))).is_err());
             assert_eq!(buffer.consumed(), 0);
-            assert_eq!((buffer.consumed() + buffer.buffered()), 4);
+            assert_eq!((buffer.consumed() + buffer.remaining()), 4);
             assert_eq!(buffer.buffer().as_ptr(), address);
             assert_eq!(buffer.buffer(), b"cdef");
             assert_eq!(buffer.buf.len(), 4);
@@ -1727,7 +1848,7 @@ mod test {
     #[test]
     fn small_consumption_does_not_repeatedly_shift_the_remaining_data() {
         for initialized in [false, true] {
-            let mut buffer = Buffer::with_capacity(128);
+            let mut buffer = BytesBuf::with_capacity(128);
             if initialized {
                 buffer.try_init(0, 128);
             }
@@ -1753,7 +1874,7 @@ mod test {
     #[test]
     fn try_reclaim_defers_small_prefixes_without_losing_data() {
         for retain in [false, true] {
-            let mut buffer = Buffer::with_capacity(16);
+            let mut buffer = BytesBuf::with_capacity(16);
             buffer.extend_from_slice(b"0123456789abcdef");
             let held = retain.then(|| buffer.split_to(4));
             buffer.consume(1);
@@ -1765,7 +1886,7 @@ mod test {
             assert_eq!(buffer.spare(), 0);
 
             // Consuming more data makes the next reclamation worthwhile.
-            buffer.consume(buffer.len() / 2 + 1);
+            buffer.consume(buffer.remaining() / 2 + 1);
             let expected = buffer.buffer().to_vec();
             assert!(buffer.try_reclaim(1));
             assert_eq!(buffer.buffer(), expected);
@@ -1779,7 +1900,7 @@ mod test {
     fn reserve_and_try_reclaim_keep_existing_space_unchanged() {
         for initialized in [false, true] {
             for consumed in [0, 2, 6] {
-                let mut buffer = Buffer::with_capacity(16);
+                let mut buffer = BytesBuf::with_capacity(16);
                 buffer.extend_from_slice(b"abcdef");
                 if initialized {
                     let spare = buffer.spare();
@@ -1789,7 +1910,7 @@ mod test {
                 let address = buffer.buffer().as_ptr();
                 let state = (
                     buffer.consumed,
-                    (buffer.consumed + buffer.buffered),
+                    (buffer.consumed + buffer.remaining),
                     buffer.buf.len(),
                     buffer.capacity(),
                 );
@@ -1805,7 +1926,7 @@ mod test {
                         assert_eq!(
                             (
                                 buffer.consumed,
-                                (buffer.consumed + buffer.buffered),
+                                (buffer.consumed + buffer.remaining),
                                 buffer.buf.len(),
                                 buffer.capacity()
                             ),
@@ -1820,7 +1941,7 @@ mod test {
 
     #[test]
     fn try_reclaim_recovers_released_splits_without_exposing_their_uninitialized_bytes() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.extend_from_slice(b"0123456789abcdef");
         let address = buffer.buffer().as_ptr();
         let mut prefix = buffer.split_to(8);
@@ -1836,7 +1957,10 @@ mod test {
         assert_eq!(buffer.spare(), 9);
         assert_eq!(buffer.spare_len(), 0);
         buffer.try_init(0xa5, 9);
-        assert_eq!(&buffer.buf[buffer.consumed + buffer.buffered..], &[0xa5; 9]);
+        assert_eq!(
+            &buffer.buf[buffer.consumed + buffer.remaining..],
+            &[0xa5; 9]
+        );
         buffer.extend_from_slice(b"gh");
         assert_eq!(buffer.buffer(), b"9abcdefgh");
     }
@@ -1845,7 +1969,7 @@ mod test {
     fn failed_try_reclaim_preserves_data_and_discards_initialized_tail() {
         for shared in [false, true] {
             for additional in [16, isize::MAX as usize, usize::MAX] {
-                let mut buffer = Buffer::with_capacity(8);
+                let mut buffer = BytesBuf::with_capacity(8);
                 buffer.extend_from_slice(b"abcdef");
                 buffer.try_init(0xa5, 2);
                 let retained = shared.then(|| buffer.split_to(1));
@@ -1864,7 +1988,7 @@ mod test {
                 }
             }
         }
-        let mut empty = Buffer::new();
+        let mut empty = BytesBuf::new();
         assert!(empty.try_reclaim(0));
         assert!(!empty.try_reclaim(1));
         assert_eq!(empty.capacity(), 0);
@@ -1873,7 +1997,7 @@ mod test {
     #[test]
     fn reserve_growth_preserves_data_with_released_and_retained_splits() {
         for retain in [false, true] {
-            let mut buffer = Buffer::with_capacity(16);
+            let mut buffer = BytesBuf::with_capacity(16);
             buffer.extend_from_slice(b"0123456789abcdef");
             let prefix = buffer.split_to(4);
             let retained = if retain {
@@ -1905,24 +2029,24 @@ mod test {
         // With three bytes remaining, compacting can supply at most five spare
         // bytes.
         for additional in [5, 6, 32] {
-            let mut buffer = Buffer::with_capacity(8);
+            let mut buffer = BytesBuf::with_capacity(8);
             buffer.extend_from_slice(b"abcdef");
             let spare = buffer.spare();
             buffer.try_init(0, spare);
-            buffer.buf[buffer.consumed + buffer.buffered..].copy_from_slice(b"XY");
+            buffer.buf[buffer.consumed + buffer.remaining..].copy_from_slice(b"XY");
             buffer.consume(3);
             buffer.reserve(additional);
             assert_eq!(buffer.buffer(), b"def");
             assert!(buffer.spare() >= additional);
             if additional == 5 {
                 assert_eq!(buffer.consumed(), 0);
-                assert_eq!((buffer.consumed() + buffer.buffered()), 3);
+                assert_eq!((buffer.consumed() + buffer.remaining()), 3);
                 assert_eq!(buffer.capacity(), 8);
-                assert_eq!(&buffer.buf[buffer.consumed + buffer.buffered..], b"defXY");
+                assert_eq!(&buffer.buf[buffer.consumed + buffer.remaining..], b"defXY");
                 assert_eq!(buffer.spare_len(), 5);
             } else {
                 assert_eq!(buffer.consumed(), 0);
-                assert_eq!((buffer.consumed() + buffer.buffered()), 3);
+                assert_eq!((buffer.consumed() + buffer.remaining()), 3);
                 assert_eq!(buffer.buf.len(), 3);
                 assert_eq!(buffer.spare_len(), 0);
             }
@@ -1948,7 +2072,7 @@ mod test {
             }
         }
 
-        let mut buffer = Buffer::with_capacity(8);
+        let mut buffer = BytesBuf::with_capacity(8);
         buffer.extend_from_slice(b"ab");
         buffer.try_init(b'x', 2);
         buffer.make_room();
@@ -1975,7 +2099,7 @@ mod test {
         );
         assert_eq!(buffer.buffer(), b"next");
 
-        let mut empty = Buffer::new();
+        let mut empty = BytesBuf::new();
         empty.make_room();
         assert_eq!(empty.write_init_buf(&mut &b"x"[..]).unwrap(), 1);
         assert_eq!(empty.buffer(), b"x");
@@ -2009,7 +2133,7 @@ mod test {
 
         for (capacity, filled, consumed, split) in [(16, 6, 4, 0), (64, 40, 0, 0), (64, 48, 0, 8)] {
             for outcome in 0..6 {
-                let mut buffer = Buffer::with_capacity(capacity);
+                let mut buffer = BytesBuf::with_capacity(capacity);
                 buffer.extend_from_slice(&vec![0x55; filled]);
                 let retained = buffer.split_to(split);
                 buffer.consume(consumed);
@@ -2052,7 +2176,7 @@ mod test {
                 Ok(2)
             }
         }
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[b'x'; 64]);
         let mut prefix = buffer.split_to(32);
         prefix.clear();
@@ -2066,7 +2190,7 @@ mod test {
     }
 
     #[test]
-    fn write_buf_commits_only_successful_reads_and_allows_retry() {
+    fn read_from_commits_only_successful_reads_and_allows_retry() {
         struct Source(usize);
         impl Read for Source {
             fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
@@ -2091,7 +2215,7 @@ mod test {
             (64, 48, 0, 8, false),
         ] {
             for outcome in 0..6 {
-                let mut buffer = Buffer::with_capacity(capacity);
+                let mut buffer = BytesBuf::with_capacity(capacity);
                 buffer.extend_from_slice(&vec![0x55; filled]);
                 let retained = buffer.split_to(split);
                 buffer.consume(consumed);
@@ -2100,7 +2224,7 @@ mod test {
                 }
                 let mut expected = vec![0x55; filled - split - consumed];
                 let mut source = Source(outcome);
-                let result = catch_unwind(AssertUnwindSafe(|| buffer.write_buf(&mut source)));
+                let result = catch_unwind(AssertUnwindSafe(|| buffer.read_from(&mut source)));
                 match outcome {
                     0 => assert_eq!(result.unwrap().unwrap(), 0),
                     1 => {
@@ -2121,10 +2245,10 @@ mod test {
                 } else {
                     assert_eq!(buffer.spare_len(), 0);
                 }
-                assert_eq!(buffer.write_buf(&mut &b"!"[..]).unwrap(), 1);
+                assert_eq!(buffer.read_from(&mut &b"!"[..]).unwrap(), 1);
                 expected.push(b'!');
                 assert_eq!(buffer.buffer(), expected);
-                assert_eq!(buffer.write_buf(&mut io::empty()).unwrap(), 0);
+                assert_eq!(buffer.read_from(&mut io::empty()).unwrap(), 0);
                 assert_eq!(buffer.buffer(), expected);
                 assert_eq!(&retained[..], vec![0x55; split]);
             }
@@ -2132,8 +2256,8 @@ mod test {
     }
 
     #[test]
-    fn write_buf_reuses_prepared_space_without_initializing_it() {
-        let mut buffer = Buffer::with_capacity(8);
+    fn read_from_reuses_prepared_space_without_initializing_it() {
+        let mut buffer = BytesBuf::with_capacity(8);
         buffer.extend_from_slice(b"ab");
         buffer.try_init(b'x', buffer.spare());
         struct Inspect<'a>(&'a [u8], &'a [u8]);
@@ -2145,7 +2269,7 @@ mod test {
             }
         }
         assert_eq!(
-            buffer.write_buf(&mut Inspect(b"xxxxxx", b"cdef")).unwrap(),
+            buffer.read_from(&mut Inspect(b"xxxxxx", b"cdef")).unwrap(),
             4
         );
         assert_eq!(buffer.buffer(), b"abcdef");
@@ -2155,7 +2279,7 @@ mod test {
         buffer.consume(6);
         assert_eq!(
             buffer
-                .write_buf(&mut Inspect(b"abcdefxx", b"next"))
+                .read_from(&mut Inspect(b"abcdefxx", b"next"))
                 .unwrap(),
             4
         );
@@ -2164,7 +2288,7 @@ mod test {
 
     #[cfg(feature = "nightly")]
     #[test]
-    fn write_buf_uses_the_cursor_and_discards_partial_reads_on_failure() {
+    fn read_from_uses_the_cursor_and_discards_partial_reads_on_failure() {
         struct Source(usize);
         impl Read for Source {
             fn read_buf(&mut self, mut dst: io::BorrowedCursor<'_, u8>) -> io::Result<()> {
@@ -2183,9 +2307,9 @@ mod test {
             }
         }
         for outcome in 0..4 {
-            let mut buffer = Buffer::with_capacity(8);
+            let mut buffer = BytesBuf::with_capacity(8);
             buffer.extend_from_slice(b"ab");
-            let result = catch_unwind(AssertUnwindSafe(|| buffer.write_buf(&mut Source(outcome))));
+            let result = catch_unwind(AssertUnwindSafe(|| buffer.read_from(&mut Source(outcome))));
             match outcome {
                 0 => assert_eq!(result.unwrap().unwrap(), 0),
                 1 => assert_eq!(result.unwrap().unwrap(), 2),
@@ -2198,7 +2322,7 @@ mod test {
             let expected: &[u8] = if outcome == 1 { b"abcd" } else { b"ab" };
             assert_eq!(buffer.buffer(), expected);
             assert_eq!(buffer.spare_len(), if outcome == 2 { 2 } else { 0 });
-            assert_eq!(buffer.write_buf(&mut &b"!"[..]).unwrap(), 1);
+            assert_eq!(buffer.read_from(&mut &b"!"[..]).unwrap(), 1);
             assert_eq!(buffer.buffer(), [expected, b"!"].concat());
         }
     }
@@ -2207,7 +2331,7 @@ mod test {
     fn allocate_returns_old_storage_and_prepares_new_capacity() {
         for consumed in [0, 2, 6] {
             for additional in [0, 1, 32] {
-                let mut buffer = Buffer::with_capacity(16);
+                let mut buffer = BytesBuf::with_capacity(16);
                 buffer.extend_from_slice(b"--abcdef");
                 let retained = buffer.split_to(2);
                 buffer.try_init(b'x', 4);
@@ -2226,7 +2350,7 @@ mod test {
                 old.fill(b'z');
                 assert_eq!(buffer.buffer(), expected);
                 assert_eq!(&retained[..], b"--");
-                assert_eq!(buffer.write_buf(&mut &b"!"[..]).unwrap(), 1);
+                assert_eq!(buffer.read_from(&mut &b"!"[..]).unwrap(), 1);
                 assert_eq!(buffer.buffer(), [expected, b"!"].concat());
                 drop(buffer);
                 assert!(old.iter().all(|&byte| byte == b'z'));
@@ -2236,7 +2360,7 @@ mod test {
 
     #[test]
     fn allocate_rejects_overflow_without_changing_buffer() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.extend_from_slice(b"abcdef");
         buffer.consume(2);
         buffer.try_init(b'x', 4);
@@ -2248,13 +2372,13 @@ mod test {
             assert_eq!(buffer.buffer().as_ptr(), address);
             assert_eq!(buffer.consumed(), 2);
             assert_eq!(buffer.capacity(), 16);
-            assert_eq!(&buffer.buf[buffer.consumed + buffer.buffered..], b"xxxx");
+            assert_eq!(&buffer.buf[buffer.consumed + buffer.remaining..], b"xxxx");
         }
     }
 
     #[test]
     fn try_init_only_fills_missing_space_and_rejects_excess() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.extend_from_slice(b"abcdef");
         buffer.consume(2);
         let address = buffer.buffer().as_ptr();
@@ -2273,7 +2397,7 @@ mod test {
         assert_eq!(buffer.buffer(), b"cdef");
         assert_eq!(buffer.buffer().as_ptr(), address);
         assert_eq!(buffer.capacity(), 16);
-        let mut empty = Buffer::new();
+        let mut empty = BytesBuf::new();
         empty.try_init(0, 0);
         assert_eq!(empty.capacity(), 0);
     }
@@ -2281,7 +2405,7 @@ mod test {
     #[test]
     fn mixed_operations_match_a_byte_queue() {
         for capacity in [0, 1, 8, 32] {
-            let mut buffer = Buffer::with_capacity(capacity);
+            let mut buffer = BytesBuf::with_capacity(capacity);
             let mut expected = Vec::new();
             let mut retained = Vec::new();
             let mut seed = 1_u64;
@@ -2328,7 +2452,7 @@ mod test {
                     }
                     6 => {
                         let bytes = vec![next() as u8; amount];
-                        let count = buffer.write_buf(&mut bytes.as_slice()).unwrap();
+                        let count = buffer.read_from(&mut bytes.as_slice()).unwrap();
                         expected.extend_from_slice(&bytes[..count]);
                     }
                     7 => buffer.reserve(amount),
@@ -2348,10 +2472,10 @@ mod test {
                         expected.clear();
                     }
                 }
-                assert!(buffer.consumed <= (buffer.consumed + buffer.buffered));
-                assert!((buffer.consumed + buffer.buffered) <= buffer.buf.len());
+                assert!(buffer.consumed <= (buffer.consumed + buffer.remaining));
+                assert!((buffer.consumed + buffer.remaining) <= buffer.buf.len());
                 assert!(buffer.buf.len() <= buffer.capacity());
-                assert_eq!(buffer.len(), expected.len());
+                assert_eq!(buffer.remaining(), expected.len());
                 assert_eq!(buffer.buffer(), expected);
                 assert_eq!(buffer.is_empty(), expected.is_empty());
                 for (bytes, saved) in &retained {
@@ -2371,7 +2495,7 @@ mod test {
         for start in 0..=data.len() + 1 {
             for end in 0..=data.len() + 1 {
                 for consume in (0..=data.len() + 1).chain([usize::MAX]) {
-                    let mut buffer = Buffer::with_capacity(32);
+                    let mut buffer = BytesBuf::with_capacity(32);
                     buffer.extend_from_slice(b"old:");
                     buffer.extend_from_slice(data);
                     buffer.advance(4);
@@ -2400,7 +2524,7 @@ mod test {
                 for consumed in 0..=4 {
                     for start in 0..=4 - consumed {
                         for end in start..=4 - consumed {
-                            let mut buffer = Buffer::with_capacity(capacity);
+                            let mut buffer = BytesBuf::with_capacity(capacity);
                             let input = b"a\0\xffz";
                             buffer.extend_from_slice(input);
                             if initialized {
@@ -2412,7 +2536,7 @@ mod test {
                             buffer.extend_from_within(start..end);
                             expected.extend_from_within(start..end);
                             assert_eq!(buffer.buffer(), expected);
-                            assert_eq!(buffer.len(), expected.len());
+                            assert_eq!(buffer.remaining(), expected.len());
                         }
                     }
                 }
@@ -2422,7 +2546,7 @@ mod test {
 
     #[test]
     fn extend_from_within_accepts_range_bounds_and_empty_ranges() {
-        let mut buffer = Buffer::with_capacity(0);
+        let mut buffer = BytesBuf::with_capacity(0);
         buffer.extend_from_within(..);
         assert!(buffer.is_empty());
         assert_eq!(buffer.capacity(), 0);
@@ -2440,7 +2564,7 @@ mod test {
         buffer.extend_from_within((Excluded(0), Included(1)));
         assert_eq!(buffer.buffer(), b"bcbcbbbc");
 
-        let len = buffer.len();
+        let len = buffer.remaining();
         buffer.extend_from_within(len..len);
         assert_eq!(buffer.buffer(), b"bcbcbbbc");
         buffer.clear();
@@ -2450,12 +2574,12 @@ mod test {
 
     #[test]
     fn extend_from_within_rejects_invalid_ranges_before_mutating() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.try_init(0, buffer.spare());
-        buffer.write_buf(&mut &b"abcdef"[..]).unwrap();
+        buffer.read_from(&mut &b"abcdef"[..]).unwrap();
         buffer.consume(2);
         let address = buffer.buffer().as_ptr();
-        let buffered_end = buffer.consumed() + buffer.buffered();
+        let buffered_end = buffer.consumed() + buffer.remaining();
         let capacity = buffer.capacity();
 
         for range in [
@@ -2469,7 +2593,7 @@ mod test {
             assert!(catch_unwind(AssertUnwindSafe(|| buffer.extend_from_within(range))).is_err());
             assert_eq!(buffer.buffer(), b"cdef");
             assert_eq!(buffer.buffer().as_ptr(), address);
-            assert_eq!((buffer.consumed() + buffer.buffered()), buffered_end);
+            assert_eq!((buffer.consumed() + buffer.remaining()), buffered_end);
             assert_eq!(buffer.capacity(), capacity);
         }
         buffer.extend_from_within(..);
@@ -2482,7 +2606,7 @@ mod test {
             for initialized in [0, 1, 2] {
                 for split in 0..3 {
                     for within in [false, true] {
-                        let mut buffer = Buffer::with_capacity(capacity);
+                        let mut buffer = BytesBuf::with_capacity(capacity);
                         buffer.extend_from_slice(b"abcdefgh");
                         buffer.consume(2);
                         let retained = match split {
@@ -2526,84 +2650,14 @@ mod test {
     }
 
     #[test]
-    fn fill_buf_reads_only_when_empty_and_can_resume_after_eof() {
-        let mut source = io::Cursor::new(b"abcdef");
-        let mut buffer = Buffer::with_capacity(4);
-        assert_eq!(buffer.fill_buf(&mut source).unwrap(), b"abcd");
-        buffer.consume(2);
-        assert_eq!(buffer.fill_buf(&mut source).unwrap(), b"cd");
-        assert_eq!(source.position(), 4);
-        buffer.consume(2);
-        assert_eq!(buffer.fill_buf(&mut source).unwrap(), b"ef");
-        buffer.consume(2);
-        for _ in 0..2 {
-            assert!(buffer.fill_buf(&mut io::empty()).unwrap().is_empty());
-        }
-        assert_eq!(buffer.fill_buf(&mut &b"\xff\0"[..]).unwrap(), b"\xff\0");
-    }
-
-    #[test]
-    fn fill_buf_errors_do_not_expose_consumed_or_failed_input() {
-        struct Reject;
-
-        impl Read for Reject {
-            fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-                assert!(!dst.is_empty());
-                dst.fill(0xa5);
-                Err(io::ErrorKind::Interrupted.into())
-            }
-        }
-
-        let mut buffer = Buffer::with_capacity(4);
-        assert_eq!(buffer.fill_buf(&mut &b"old"[..]).unwrap(), b"old");
-        // Buffered input is returned without consulting even a failing source.
-        assert_eq!(buffer.fill_buf(&mut Reject).unwrap(), b"old");
-        buffer.consume(3);
-        assert_eq!(
-            buffer.fill_buf(&mut Reject).unwrap_err().kind(),
-            io::ErrorKind::Interrupted
-        );
-        assert!(buffer.buffer().is_empty());
-        let mut source = &b"ok"[..];
-        // Empty buffers reuse consumed space after the failed read.
-        assert_eq!(buffer.fill_buf(&mut source).unwrap(), b"ok");
-        assert!(source.is_empty());
-    }
-
-    #[test]
-    fn fill_buf_allocates_on_demand_and_preserves_split_items() {
-        let input: Vec<u8> = (0..64).collect();
-        for capacity in [0, 4] {
-            let mut buffer = Buffer::with_capacity(capacity);
-            let mut source = &input[..];
-            let first_len = buffer.fill_buf(&mut source).unwrap().len();
-            assert!(first_len > 0);
-            let owned = buffer.split_bytes(..first_len, 0);
-            let mut output = owned.to_vec();
-            loop {
-                let chunk = buffer.fill_buf(&mut source).unwrap();
-                if chunk.is_empty() {
-                    break;
-                }
-                output.extend_from_slice(chunk);
-                let consumed = chunk.len();
-                buffer.consume(consumed);
-            }
-            assert_eq!(output, input);
-            drop(buffer);
-            assert_eq!(&owned[..], &input[..first_len]);
-        }
-    }
-
-    #[test]
     fn buf_cursor_operations_agree_with_buffered_bytes() {
         fn header<B: Buf>(input: &mut B) -> (u16, u16) {
             (input.get_u16(), input.get_u16())
         }
 
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.try_init(0, buffer.spare());
-        buffer.write_buf(&mut &b"\x01\x02\x03\x04tail"[..]).unwrap();
+        buffer.read_from(&mut &b"\x01\x02\x03\x04tail"[..]).unwrap();
         assert_eq!(header(&mut buffer), (0x0102, 0x0304));
         assert_eq!(buffer.chunk(), b"tail");
         assert_eq!(buffer.remaining(), 4);
@@ -2618,10 +2672,53 @@ mod test {
     }
 
     #[test]
+    fn consume_with_leaves_input_available_on_short_input_or_panic() {
+        let mut buffer = BytesBuf::with_capacity(8);
+        buffer.extend_from_slice(b"abcdef");
+        buffer.consume(1);
+        assert!(!buffer.consume_with(6, |_| panic!("must not be called")));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                buffer.consume_with(3, |bytes| {
+                    assert_eq!(bytes, b"bcd");
+                    panic!("visitor panic");
+                });
+            }))
+            .is_err()
+        );
+        assert_eq!(buffer.consumed(), 1);
+        assert_eq!(buffer.buffer(), b"bcdef");
+        assert!(buffer.consume_with(3, |bytes| assert_eq!(bytes, b"bcd")));
+        assert_eq!(buffer.buffer(), b"ef");
+    }
+
+    #[test]
+    fn unconsume_restores_only_bytes_still_owned_by_the_buffer() {
+        let mut buffer = BytesBuf::with_capacity(16);
+        buffer.extend_from_slice(b"abcdefgh");
+        let retained = buffer.take_bytes(1..3, Some(5));
+        assert_eq!(&retained[..], b"bc");
+        assert_eq!(buffer.consumed(), 2);
+        buffer.unconsume(0);
+        buffer.unconsume(2);
+        assert_eq!(buffer.buffer(), b"defgh");
+        buffer.consume(3);
+        let before = (buffer.consumed(), buffer.buffer().to_vec());
+        assert!(catch_unwind(AssertUnwindSafe(|| buffer.unconsume(4))).is_err());
+        assert_eq!((buffer.consumed(), buffer.buffer().to_vec()), before);
+        buffer.unconsume(3);
+        buffer.consume(2);
+        buffer.compact();
+        assert!(catch_unwind(AssertUnwindSafe(|| buffer.unconsume(1))).is_err());
+        assert_eq!(buffer.buffer(), b"fgh");
+        assert_eq!(&retained[..], b"bc");
+    }
+
+    #[test]
     fn advance_and_consume_reject_excess_without_changing_input() {
-        let mut buffer = Buffer::with_capacity(8);
+        let mut buffer = BytesBuf::with_capacity(8);
         buffer.try_init(0, buffer.spare());
-        buffer.write_buf(&mut &b"abcdef"[..]).unwrap();
+        buffer.read_from(&mut &b"abcdef"[..]).unwrap();
         buffer.consume(2);
         for count in [5, usize::MAX] {
             let consumed = buffer.consumed();
@@ -2642,7 +2739,7 @@ mod test {
 
         buffer.compact();
         buffer.try_init(0, buffer.spare());
-        assert_eq!(buffer.write_buf(&mut &b"next"[..]).unwrap(), 4);
+        assert_eq!(buffer.read_from(&mut &b"next"[..]).unwrap(), 4);
         assert_eq!(buffer.chunk(), b"next");
     }
 
@@ -2653,9 +2750,9 @@ mod test {
             for end in 0..=input.len() {
                 for start in 0..=end {
                     for additional in [0, 1, capacity / 2, capacity, capacity * 3] {
-                        let mut buffer = Buffer::with_capacity(capacity);
+                        let mut buffer = BytesBuf::with_capacity(capacity);
                         buffer.try_init(0, buffer.spare());
-                        buffer.write_buf(&mut &input[..end]).unwrap();
+                        buffer.read_from(&mut &input[..end]).unwrap();
                         buffer.advance(start);
 
                         buffer.reserve(additional);
@@ -2668,7 +2765,7 @@ mod test {
                         if additional != 0 {
                             let more = vec![0xff; additional];
                             buffer.try_init(0, additional);
-                            assert_eq!(buffer.write_buf(&mut &more[..]).unwrap(), additional);
+                            assert_eq!(buffer.read_from(&mut &more[..]).unwrap(), additional);
                             let expected = [&input[start..end], &more[..]].concat();
                             assert_eq!(buffer.buffer(), expected);
                         }
@@ -2683,34 +2780,34 @@ mod test {
         let input = b"abcdef";
         for start in 0..=input.len() {
             for at in 0..=input.len() - start {
-                let mut buffer = Buffer::with_capacity(16);
+                let mut buffer = BytesBuf::with_capacity(16);
                 buffer.try_init(0, buffer.spare());
-                buffer.write_buf(&mut &input[..]).unwrap();
+                buffer.read_from(&mut &input[..]).unwrap();
                 buffer.advance(start);
                 let address = buffer.buffer().as_ptr() as usize;
                 let suffix = buffer.split_off(at);
                 assert_eq!(buffer.buffer(), &input[start..start + at]);
-                assert_eq!(buffer.len(), at);
+                assert_eq!(buffer.remaining(), at);
                 assert_eq!(&suffix[..], &input[start + at..]);
                 if !suffix.is_empty() {
                     assert_eq!(suffix.as_ptr() as usize, address + at);
                 }
             }
         }
-        let mut empty = Buffer::with_capacity(1);
+        let mut empty = BytesBuf::with_capacity(1);
         assert!(empty.split_off(0).is_empty());
         assert!(empty.is_empty());
         empty.reserve(1);
         empty.try_init(0, 1);
-        assert_eq!(empty.write_buf(&mut &b"x"[..]).unwrap(), 1);
+        assert_eq!(empty.read_from(&mut &b"x"[..]).unwrap(), 1);
         assert_eq!(empty.buffer(), b"x");
     }
 
     #[test]
     fn split_off_rejects_indices_past_input_before_changing_the_window() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.try_init(0, buffer.spare());
-        buffer.write_buf(&mut &b"abcdef"[..]).unwrap();
+        buffer.read_from(&mut &b"abcdef"[..]).unwrap();
         buffer.advance(2);
         for at in [5, usize::MAX] {
             assert!(catch_unwind(AssertUnwindSafe(|| buffer.split_off(at))).is_err());
@@ -2722,7 +2819,7 @@ mod test {
 
     #[test]
     fn reserve_reclaims_released_storage_without_allocating() {
-        let mut buffer = Buffer::with_capacity(16);
+        let mut buffer = BytesBuf::with_capacity(16);
         buffer.extend_from_slice(b"0123456789abcdef");
         let address = buffer.buffer().as_ptr();
         drop(buffer.split_to(12));
@@ -2744,7 +2841,7 @@ mod test {
             for split in [0, 4, 8] {
                 for consumed in [0, 2, 8] {
                     for additional in [0, 1, 8, usize::MAX] {
-                        let mut buffer = Buffer::with_capacity(16);
+                        let mut buffer = BytesBuf::with_capacity(16);
                         buffer.extend_from_slice(b"0123456789abcdef");
                         let prefix = (split != 0).then(|| buffer.split_to(split));
                         let retained = if retain {
@@ -2775,7 +2872,7 @@ mod test {
     fn take_views_accept_ranges_without_copying() {
         fn check<I: std::ops::RangeBounds<usize> + Clone>(range: I, start: usize, end: usize) {
             for consume in [None].into_iter().chain((0..=6).map(Some)) {
-                let mut buffer = Buffer::with_capacity(32);
+                let mut buffer = BytesBuf::with_capacity(32);
                 buffer.extend_from_slice(b"old:abcdef");
                 buffer.consume(4);
                 let address = buffer.buffer().as_ptr();
@@ -2803,10 +2900,10 @@ mod test {
     #[test]
     fn take_view_rejects_invalid_slice_ranges_without_consuming_input() {
         fn check(range: impl std::ops::RangeBounds<usize>, consume: usize) {
-            let mut buffer = Buffer::with_capacity(32);
+            let mut buffer = BytesBuf::with_capacity(32);
             let spare = buffer.spare();
             buffer.try_init(0, spare);
-            buffer.write_buf(&mut &b"old:abcdef"[..]).unwrap();
+            buffer.read_from(&mut &b"old:abcdef"[..]).unwrap();
             buffer.consume(4);
             let address = buffer.buffer().as_ptr();
             let consumed = buffer.consumed();
@@ -2848,7 +2945,7 @@ mod test {
     #[test]
     fn custom_indices_and_bounds_work_for_views_and_appending_across_reservation() {
         for capacity in [0, 8, 32] {
-            let mut buffer = Buffer::with_capacity(capacity);
+            let mut buffer = BytesBuf::with_capacity(capacity);
             buffer.extend_from_slice(b"old:abcdef");
             buffer.consume(4);
             let address = buffer.buffer().as_ptr();
@@ -2858,7 +2955,7 @@ mod test {
             assert_eq!(buffer.buffer(), b"bcdef");
             buffer.extend_from_within(Tail(2));
             assert_eq!(buffer.buffer(), b"bcdefdef");
-            buffer.extend_from_within(Tail(buffer.len()));
+            buffer.extend_from_within(Tail(buffer.remaining()));
             assert_eq!(buffer.buffer(), b"bcdefdef");
         }
     }
@@ -2866,7 +2963,7 @@ mod test {
     #[test]
     fn reclaimed_split_storage_can_be_filled_and_read_again() {
         for capacity in [256, 1024] {
-            let mut buffer = Buffer::with_capacity(capacity);
+            let mut buffer = BytesBuf::with_capacity(capacity);
             buffer.extend_from_slice(&vec![b'x'; capacity]);
             drop(buffer.split_to(capacity - 128));
             assert_eq!(buffer.capacity(), 128);
@@ -2875,12 +2972,12 @@ mod test {
             assert_eq!(buffer.capacity(), capacity);
             assert_eq!(buffer.buffer_size, capacity);
             buffer.extend_from_slice(&vec![b'y'; buffer.spare()]);
-            assert_eq!(buffer.buffered, capacity);
+            assert_eq!(buffer.remaining, capacity);
             assert_eq!(buffer.spare(), 0);
 
             let expected = buffer.buffer().to_vec();
             let mut input = &b"!"[..];
-            assert_eq!(buffer.write_buf(&mut input).unwrap(), 1);
+            assert_eq!(buffer.read_from(&mut input).unwrap(), 1);
             assert!(input.is_empty());
             assert_eq!(&buffer.buffer()[..expected.len()], expected);
             assert_eq!(&buffer.buffer()[expected.len()..], b"!");
@@ -2899,7 +2996,7 @@ mod test {
     #[test]
     fn clearing_or_consuming_all_input_reuses_storage() {
         for clear in [false, true] {
-            let mut buffer = Buffer::with_capacity(64);
+            let mut buffer = BytesBuf::with_capacity(64);
             buffer.extend_from_slice(b"old");
             buffer.try_init(0xa5, buffer.spare());
             let address = buffer.buf.as_ptr();
@@ -2911,7 +3008,7 @@ mod test {
             assert!(buffer.is_empty());
             assert_eq!(&buffer.buf[..3], b"old");
             assert!(buffer.buf[3..].iter().all(|&byte| byte == 0xa5));
-            assert_eq!(buffer.write_buf(&mut &b"new"[..]).unwrap(), 3);
+            assert_eq!(buffer.read_from(&mut &b"new"[..]).unwrap(), 3);
             assert_eq!(buffer.buffer(), b"new");
             assert_eq!(buffer.buf.as_ptr(), address);
             assert_eq!(buffer.capacity(), 64);
@@ -2935,7 +3032,7 @@ mod test {
                 (64, 32, false),
                 (64, 64, false),
             ] {
-                let mut buffer = Buffer::with_capacity(64);
+                let mut buffer = BytesBuf::with_capacity(64);
                 buffer.extend_from_slice(&vec![0x5a; filled]);
                 buffer.consume(consumed);
                 if initialized {
@@ -2958,7 +3055,7 @@ mod test {
 
     #[test]
     fn make_room_reuses_capacity_across_refills() {
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[b'x'; 64]);
         let address = buffer.buf.as_ptr();
         for _ in 0..3 {
@@ -2974,7 +3071,7 @@ mod test {
 
     #[test]
     fn exhausted_views_use_the_recorded_growth_size() {
-        let mut buffer = Buffer::with_capacity(64);
+        let mut buffer = BytesBuf::with_capacity(64);
         buffer.extend_from_slice(&[0x55; 64]);
         buffer.make_room();
         assert!(buffer.capacity() >= 128);
@@ -2982,12 +3079,190 @@ mod test {
         assert_eq!(grown, buffer.capacity());
         let rest = buffer.spare();
         buffer.extend_from_slice(&vec![0x66; rest]);
-        let retained = buffer.split_to(buffer.len());
+        let retained = buffer.split_to(buffer.remaining());
         assert_eq!(buffer.capacity(), 0);
         buffer.make_room();
         assert!(buffer.capacity() >= grown.div_ceil(2));
         assert_eq!(buffer.buffer_size, grown);
         assert_eq!(&retained[..64], &[0x55; 64]);
         assert_eq!(&retained[64..], vec![0x66; rest]);
+    }
+
+    // Former public documentation examples stay executable inside this private module.
+    #[test]
+    fn example_buffer_reuses_consumed_storage() {
+        let mut buffer = BytesBuf::with_capacity(8);
+        buffer.extend_from_slice(b"abcdef");
+
+        let view = buffer.take_view(..4, None);
+        assert_eq!(view, b"abcd");
+        assert_eq!(buffer.buffer(), b"ef");
+
+        buffer.extend_from_slice(b"ghij");
+        assert_eq!(buffer.buffer(), b"efghij");
+        assert_eq!(buffer.capacity(), 8);
+    }
+
+    #[test]
+    fn example_clear() {
+        let mut buf = BytesBuf::with_capacity(32);
+        buf.extend_from_slice(b"hello");
+        let capacity = buf.capacity();
+        buf.clear();
+
+        assert!(buf.is_empty());
+        assert_eq!(buf.capacity(), capacity);
+    }
+
+    #[test]
+    fn example_buffer() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello world");
+        buf.consume(6);
+
+        assert_eq!(buf.buffer(), b"world");
+    }
+
+    #[test]
+    fn example_split_bytes() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"<hello>tail");
+        let bytes = buf.take_bytes(1..6, Some(7));
+
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(buf.buffer(), b"tail");
+    }
+
+    #[test]
+    fn example_take_view() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello world");
+        let view = buf.take_view(6..11, Some(6));
+
+        assert_eq!(view, b"world");
+        assert_eq!(buf.buffer(), b"world");
+    }
+
+    #[test]
+    fn example_consume() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello world");
+        buf.consume(6);
+        assert_eq!(buf.buffer(), b"world");
+
+        buf.consume(5);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn example_consume_with() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"abc");
+        let mut prefix = [0; 2];
+        assert!(buf.consume_with(2, |bytes| prefix.copy_from_slice(bytes)));
+        assert_eq!(&prefix, b"ab");
+        assert_eq!(buf.buffer(), b"c");
+        assert!(!buf.consume_with(2, |_| unreachable!()));
+    }
+
+    #[test]
+    fn example_unconsume() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"abc");
+        buf.consume(2);
+        buf.unconsume(1);
+        assert_eq!(buf.buffer(), b"bc");
+    }
+
+    #[test]
+    fn example_compact() {
+        let mut buf = BytesBuf::with_capacity(16);
+        buf.extend_from_slice(b"hello world");
+        buf.consume(6);
+        assert_eq!(buf.spare(), 5);
+
+        buf.compact();
+
+        assert_eq!(buf.buffer(), b"world");
+        assert_eq!(buf.spare(), 11);
+    }
+
+    #[test]
+    fn example_reserve() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"old:hello");
+        buf.consume(4);
+        buf.reserve(64);
+
+        assert_eq!(buf.buffer(), b"hello");
+        assert!(buf.spare() >= 64);
+        buf.extend_from_slice(b" world");
+        assert_eq!(buf.buffer(), b"hello world");
+    }
+
+    #[test]
+    fn example_try_reclaim() {
+        let mut buf = BytesBuf::with_capacity(8);
+        buf.extend_from_slice(b"abcdefgh");
+        buf.consume(4);
+
+        assert!(buf.try_reclaim(2));
+        assert_eq!(buf.buffer(), b"efgh");
+        assert_eq!(buf.capacity(), 8);
+
+        buf.consume(1);
+        assert!(!buf.try_reclaim(usize::MAX));
+        assert_eq!(buf.buffer(), b"fgh");
+    }
+
+    #[test]
+    fn example_split_to() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello world");
+        let first = buf.split_to(5);
+
+        assert_eq!(&first[..], b"hello");
+        assert_eq!(buf.buffer(), b" world");
+    }
+
+    #[test]
+    fn example_split_off() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello world");
+        let second = buf.split_off(5);
+
+        assert_eq!(buf.buffer(), b"hello");
+        assert_eq!(&second[..], b" world");
+    }
+
+    #[test]
+    fn example_extend_from_slice() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello");
+        buf.extend_from_slice(b" world");
+
+        assert_eq!(buf.buffer(), b"hello world");
+    }
+
+    #[test]
+    fn example_extend_from_within() {
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"old:abc");
+        buf.consume(4);
+        buf.extend_from_within(1..3);
+
+        assert_eq!(buf.buffer(), b"abcbc");
+    }
+
+    #[test]
+    fn example_copy_to_bytes() {
+        use bytes::Buf;
+
+        let mut buf = BytesBuf::new();
+        buf.extend_from_slice(b"hello world");
+        let bytes = buf.copy_to_bytes(5);
+
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(buf.buffer(), b" world");
     }
 }

@@ -35,6 +35,17 @@ use crate::Config;
 mod tests;
 ```
 
+# Rust Module File Layout
+
+- If a module contains only its own implementation and tests, keep both in a
+  single `module_name.rs` file, with an inline test module. Split out the tests
+  only when that file becomes exceptionally long.
+- Keep the crate root's tests and shared test helpers in an inline test module
+  in `lib.rs` as well. Do not create a separate `test.rs` or `tests.rs` unless
+  the test code becomes exceptionally long.
+- If a module has any non-test child modules, use a `module_name/` directory
+  with a `mod.rs` file and files for its child modules.
+
 # Documentation Requirements
 
 - Apply these requirements throughout the project, not just to particular types
@@ -111,6 +122,17 @@ mod tests;
   cloning. The corresponding `Into` calls are also permitted. Document the
   inherited copying costs and preserve the underlying implementation's lifetime
   and validity requirements.
+
+# Performance Results
+
+- When comparing performance across record sizes, show enough intermediate
+  measurements to make changes and crossover points visible. Do not jump over
+  large size ranges when discussing where one approach becomes faster.
+- For comparisons focused on records from 0 to 500 B, report each measured size
+  at 20 B intervals. If a different range or interval is requested, report each
+  requested size separately rather than replacing the results with an aggregate.
+- Identify gaps in measured sizes and do not infer a precise crossover point
+  from widely spaced measurements. Measure intermediate sizes when needed.
 
 # Commit Messages
 

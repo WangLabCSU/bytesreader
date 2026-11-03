@@ -1,14 +1,14 @@
 [package]
-name = "decen"
-version = "0.2.0"
+name = "bytesreader"
+version = "0.0.1"
 authors = ["Yun Peng <pengyun.me@outlook.com>"]
 edition = "2024"
-description = "A decoder and encoder (decen) framework for byte streams"
+description = "A growable buffered reader backed by the bytes crate"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/WangLabCSU/decen"
-keywords = ["codec", "framing", "io", "buffer", "zero-copy"]
-categories = ["encoding"]
+keywords = ["io", "buffer", "reader", "bytes", "zero-copy"]
+categories = ["parsing"]
 exclude = ["/AGENTS.md", "/.github/", "/.gitignore", "/rust-toolchain.toml"]
 
 [features]
@@ -18,7 +18,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 
 [dependencies]
 bytes = "1.12.*"
-hotpath = "0.30.3"
+hotpath = "0.30.*"
 
 [dev-dependencies]
 memchr = "2.8"
@@ -34,9 +34,9 @@ debug = true
 strip = false
 
 [[bench]]
-name = "read"
+name = "methods"
 harness = false
 
 [[bench]]
-name = "write"
+name = "reading"
 harness = false

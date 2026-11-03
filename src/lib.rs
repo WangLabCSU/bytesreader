@@ -5,8 +5,10 @@
     feature(borrowed_buf_init, core_io_borrowed_buf, read_buf)
 )]
 
-pub mod read;
-pub mod write;
+mod buffer;
+mod bytesreader;
+
+pub use self::bytesreader::BytesReader;
 
 // ESP-IDF has a smaller default to accommodate limited RAM.
 const DEFAULT_BUF_SIZE: usize = cfg_select! {
@@ -14,9 +16,6 @@ const DEFAULT_BUF_SIZE: usize = cfg_select! {
     _ => 8 << 10,
 };
 
-// Shared allocation counter for buffer and reader tests. These tests check
-// memory reuse and avoidable allocations that content or capacity checks alone
-// cannot detect. This module provides test support rather than test cases.
 #[cfg(test)]
 mod test {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -26,17 +25,25 @@ mod test {
     // other.
     thread_local! {
         static TRACK: Cell<bool> = const { Cell::new(false) };
-        static COUNT: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static COUNT: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static FAIL_NEXT_ALLOCATION: Cell<bool> = const { Cell::new(false) };
     }
 
     struct Allocator;
 
-    // SAFETY: operations forward the caller's pointer/layout to System.
-    // The counters use const thread-local Cells and do not allocate.
+    // SAFETY: successful operations forward the caller's pointer/layout to
+    // System. An injected failure returns null without touching an existing
+    // allocation. The const thread-local Cells do not allocate.
     unsafe impl GlobalAlloc for Allocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             if TRACK.try_with(Cell::get).unwrap_or(false) {
                 COUNT.with(|n| n.set(n.get() + 1));
+            }
+            if FAIL_NEXT_ALLOCATION
+                .try_with(|fail| fail.replace(false))
+                .unwrap_or(false)
+            {
+                return std::ptr::null_mut();
             }
             unsafe { System.alloc(layout) }
         }
@@ -48,6 +55,12 @@ mod test {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
             if TRACK.try_with(Cell::get).unwrap_or(false) {
                 COUNT.with(|n| n.set(n.get() + 1));
+            }
+            if FAIL_NEXT_ALLOCATION
+                .try_with(|fail| fail.replace(false))
+                .unwrap_or(false)
+            {
+                return std::ptr::null_mut();
             }
             unsafe { System.realloc(ptr, layout, size) }
         }

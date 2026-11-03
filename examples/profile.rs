@@ -8,8 +8,7 @@ use std::io::{self, Read, Seek, Write};
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::BytesMut;
-use decen::read::{BytesDecoder, Frame, FramedRead, Framer, OwnedDecoder, ViewDecoder};
+use bytesreader::BytesReader;
 use memchr::memchr;
 
 #[cfg(feature = "hotpath-alloc")]
@@ -21,45 +20,42 @@ struct Lines {
     scanned: usize,
 }
 
-impl Framer for Lines {
-    type Error = io::Error;
-
+impl Lines {
     #[hotpath::measure(impl_type = "Lines")]
-    unsafe fn frame(&mut self, src: &[u8]) -> io::Result<Frame> {
+    fn find_end(&mut self, src: &[u8]) -> Option<usize> {
         if let Some(offset) = memchr(b'\n', &src[self.scanned..]) {
             let end = self.scanned + offset + 1;
             self.scanned = 0;
-            Ok(Frame::ready(..end))
+            Some(end)
         } else {
             self.scanned = src.len();
-            Ok(Frame::need_more())
+            None
+        }
+    }
+
+    #[hotpath::measure(impl_type = "Lines")]
+    fn next_end<R: Read>(&mut self, reader: &mut BytesReader<R>) -> io::Result<Option<usize>> {
+        loop {
+            if let Some(end) = self.find_end(reader.buffer()) {
+                return Ok(Some(end));
+            }
+            if reader.read_more()? == 0 {
+                return if reader.buffer().is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "incomplete line",
+                    ))
+                };
+            }
         }
     }
 }
 
-impl BytesDecoder for Lines {
-    type Item = BytesMut;
-
-    unsafe fn decode_bytes(&mut self, frame: BytesMut) -> io::Result<Self::Item> {
-        Ok(frame)
-    }
-}
-
-impl ViewDecoder for Lines {
-    type Item<'a> = &'a [u8];
-
-    unsafe fn decode_view<'a>(&mut self, frame: &'a [u8]) -> io::Result<Self::Item<'a>> {
-        Ok(frame)
-    }
-}
-
-impl OwnedDecoder for Lines {
-    type Item = Vec<u8>;
-
-    #[hotpath::measure(impl_type = "Lines")]
-    unsafe fn decode_owned(&mut self, frame: &[u8]) -> io::Result<Self::Item> {
-        Ok(frame.to_vec())
-    }
+#[hotpath::measure]
+fn copy_frame(frame: &[u8]) -> Vec<u8> {
+    frame.to_vec()
 }
 
 fn observe<const VERIFY: bool>(item: &[u8], totals: &mut (usize, usize)) {
@@ -76,29 +72,23 @@ fn observe<const VERIFY: bool>(item: &[u8], totals: &mut (usize, usize)) {
 
 // Each invocation creates a reader, reads the whole file, and drops every
 // result before requesting the next Item. Rewinding happens at the call site.
-fn decode_file<R: Read, const MODE: usize, const VERIFY: bool>(
+fn process_file<R: Read, const MODE: usize, const VERIFY: bool>(
     source: R,
     capacity: usize,
 ) -> io::Result<(usize, usize)> {
-    let mut reader = FramedRead::with_capacity(source, Lines::default(), capacity);
+    let mut reader = BytesReader::with_capacity(capacity, source);
+    let mut lines = Lines::default();
     let mut totals = (0, 0);
-    match MODE {
-        0 => {
-            while let Some(item) = reader.decode_bytes()? {
+    while let Some(end) = lines.next_end(&mut reader)? {
+        match MODE {
+            0 => observe::<VERIFY>(&reader.take_bytes(..end, None), &mut totals),
+            1 => observe::<VERIFY>(reader.take_view(..end, None), &mut totals),
+            2 => {
+                let item = copy_frame(reader.take_view(..end, None));
                 observe::<VERIFY>(&item, &mut totals);
             }
+            _ => unreachable!(),
         }
-        1 => {
-            while let Some(item) = reader.decode_view()? {
-                observe::<VERIFY>(item, &mut totals);
-            }
-        }
-        2 => {
-            while let Some(item) = reader.decode_owned()? {
-                observe::<VERIFY>(&item, &mut totals);
-            }
-        }
-        _ => unreachable!(),
     }
     Ok(totals)
 }
@@ -112,7 +102,7 @@ fn read_file<const MODE: usize>(file: &mut File, capacity: usize) -> io::Result<
     let source = hotpath::io!(file, label = "input-file");
     #[cfg(feature = "nightly")]
     let source = file;
-    decode_file::<_, MODE, false>(source, capacity)
+    process_file::<_, MODE, false>(source, capacity)
 }
 
 struct Input {
@@ -131,8 +121,10 @@ impl Input {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("decen-profile-read-{}-{stamp}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "bytesreader-profile-read-{}-{stamp}",
+            std::process::id()
+        ));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -173,19 +165,19 @@ fn profile<const MODE: usize>(payload: usize, capacity: usize, passes: usize) ->
     let mut input = Input::new(payload)?;
     let expected = (input.items, input.bytes);
     assert_eq!(
-        decode_file::<_, MODE, true>(&mut input.file, capacity)?,
+        process_file::<_, MODE, true>(&mut input.file, capacity)?,
         expected
     );
     for _ in 0..5 {
         input.file.rewind()?;
         assert_eq!(
-            decode_file::<_, MODE, false>(&mut input.file, capacity)?,
+            process_file::<_, MODE, false>(&mut input.file, capacity)?,
             expected
         );
     }
 
     // Start the reporting session after data generation and content verification.
-    let _guard = hotpath::HotpathGuardBuilder::new("profile_read")
+    let _guard = hotpath::HotpathGuardBuilder::new("profile")
         .functions_limit(0)
         .build();
     let mut elapsed = std::time::Duration::ZERO;
