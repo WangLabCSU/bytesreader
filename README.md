@@ -1,9 +1,9 @@
 # bytesreader
 
-[<img alt="github" src="https://img.shields.io/badge/github-WangLabCSU/decen-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/WangLabCSU/decen)
+[<img alt="github" src="https://img.shields.io/badge/github-WangLabCSU/bytesreader-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/WangLabCSU/bytesreader)
 [<img alt="crates.io" src="https://img.shields.io/crates/v/bytesreader.svg?style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/bytesreader)
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-bytesreader-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/bytesreader)
-[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/WangLabCSU/decen/ci.yml?branch=main&style=for-the-badge" height="20">](https://github.com/WangLabCSU/decen/actions?query=branch%3Amain)
+[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/WangLabCSU/bytesreader/ci.yml?branch=main&style=for-the-badge" height="20">](https://github.com/WangLabCSU/bytesreader/actions?query=branch%3Amain)
 
 **bytesreader** is a growable buffered reader for records, including those
 larger than its input buffer. Keep data in the buffer while reading more,
