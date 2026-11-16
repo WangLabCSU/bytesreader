@@ -1,6 +1,6 @@
 [package]
 name = "bytesreader"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["Yun Peng <pengyun.me@outlook.com>"]
 edition = "2024"
 description = "A growable buffered reader backed by the bytes crate"
