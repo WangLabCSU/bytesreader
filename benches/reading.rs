@@ -18,6 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BytesMut};
 use bytesreader::BytesReader;
+use leftover::LeftoverReader;
 use memchr::memchr;
 
 #[path = "src/table.rs"]
@@ -27,14 +28,14 @@ const CAPACITY: usize = 8 << 10;
 // One complete rotation gives every method each timing position once.
 const SAMPLES: usize = DEFAULT_MODES.len();
 const ROUNDS: usize = 4;
-const DEFAULT_MODES: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-const ALIGNED_MODES: [usize; 19] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+const DEFAULT_MODES: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21];
+const ALIGNED_MODES: [usize; 22] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
 ];
 const LIMITED_MODES: [usize; 6] = [13, 14, 15, 16, 17, 18];
 // Reader, complete-record operation, and handling when a record spans reads.
 // This describes the benchmark loops; it does not limit the reader APIs.
-const METHODS: [(&str, &str, &str); 19] = [
+const METHODS: [(&str, &str, &str); 22] = [
     (
         "BytesReader",
         "take_bytes(..end, None)",
@@ -130,12 +131,27 @@ const METHODS: [(&str, &str, &str); 19] = [
         "take_view(..end, None).to_vec()",
         "Stop if a read ends inside a record. This test cannot join data from separate reads.",
     ),
+    (
+        "LeftoverReader<BufReader>",
+        "fill_view() + view.take_view(end)",
+        "Copy the parts of the record into a temporary Vec, then process a slice of that Vec.",
+    ),
+    (
+        "LeftoverReader<BufReader>",
+        "fill_view() + view.take_owned(end)",
+        "Copy earlier chunks into a temporary Vec, then copy those bytes and the final chunk into a new result Vec. Reuse the temporary Vec for the next record.",
+    ),
+    (
+        "std::io::BufReader",
+        "leftover::read_until(&mut reader, b'\\n', &mut Vec::new())",
+        "read_until copies data from successive reads into the result Vec until it finds the newline.",
+    ),
 ];
 
 // Establish Item groups and reader order. Footnote variants are grouped before
 // printing; measurement order still rotates independently.
-const DISPLAY_ORDER: [usize; 19] = [
-    1, 15, 17, 3, 13, 6, 2, 9, 10, 16, 18, 4, 11, 14, 5, 7, 0, 12, 8,
+const DISPLAY_ORDER: [usize; 22] = [
+    1, 15, 17, 3, 13, 19, 6, 2, 9, 10, 16, 18, 4, 11, 14, 20, 5, 21, 7, 0, 12, 8,
 ];
 
 // Use the same LF search and include LF in every returned frame.
@@ -502,7 +518,53 @@ fn run<R: Read, const VERIFY: bool>(source: R, mode: usize, capacity: usize) -> 
         18 => without_scratch_take_view::<_, true, VERIFY>(BytesReader::with_capacity(
             capacity, source,
         )),
+        19 => leftover_reader::<_, false, VERIFY>(source, capacity),
+        20 => leftover_reader::<_, true, VERIFY>(source, capacity),
+        21 => leftover_until::<_, VERIFY>(source, capacity),
         _ => unreachable!(),
+    }
+}
+
+#[inline(never)]
+fn leftover_reader<R: Read, const OWNED: bool, const VERIFY: bool>(
+    source: R,
+    capacity: usize,
+) -> (usize, usize) {
+    let mut reader = LeftoverReader::new(BufReader::with_capacity(capacity, source));
+    let mut totals = (0, 0);
+    loop {
+        let view = reader.fill_view().unwrap();
+        let buf = view.buffer();
+        if buf.is_empty() {
+            assert!(view.leftover().is_empty(), "incomplete line");
+            return totals;
+        }
+        // Earlier chunks have already been searched and saved by accumulate.
+        // end counts only bytes in the current chunk for both take operations.
+        if let Some(end) = find_line_end(buf) {
+            if OWNED {
+                let item = view.take_owned(end);
+                observe::<VERIFY>(&item, &mut totals);
+            } else {
+                observe::<VERIFY>(view.take_view(end), &mut totals);
+            }
+        } else {
+            view.accumulate();
+        }
+    }
+}
+
+#[inline(never)]
+fn leftover_until<R: Read, const VERIFY: bool>(source: R, capacity: usize) -> (usize, usize) {
+    let mut reader = BufReader::with_capacity(capacity, source);
+    let mut totals = (0, 0);
+    loop {
+        // Match the std::read_until control's fresh Vec for each record.
+        let mut item = Vec::new();
+        if leftover::read_until(&mut reader, b'\n', &mut item).unwrap() == 0 {
+            return totals;
+        }
+        observe::<VERIFY>(&item, &mut totals);
     }
 }
 
@@ -573,11 +635,11 @@ fn compare<R: Read + Seek>(
     // ownership and allocation costs even though both own their bytes.
     // Restricted controls cannot handle split records and do not participate
     // in the ordinary comparisons, even when the aligned input lets them run.
-    let borrowed_best = [1, 3, 6]
+    let borrowed_best = [1, 3, 6, 19]
         .into_iter()
         .filter_map(|mode| sorted_median(&times[mode]))
         .fold(f64::INFINITY, f64::min);
-    let vec_best = [2, 4, 5, 7, 9, 10, 11]
+    let vec_best = [2, 4, 5, 7, 9, 10, 11, 20, 21]
         .into_iter()
         .filter_map(|mode| sorted_median(&times[mode]))
         .fold(f64::INFINITY, f64::min);
@@ -593,7 +655,7 @@ fn compare<R: Read + Seek>(
             continue;
         };
         let (item, best) = match mode {
-            1 | 3 | 6 | 13 | 15 | 17 => ("&[u8]", borrowed_best),
+            1 | 3 | 6 | 13 | 15 | 17 | 19 => ("&[u8]", borrowed_best),
             0 | 8 | 12 => ("BytesMut", bytes_best),
             _ => ("Vec<u8>", vec_best),
         };

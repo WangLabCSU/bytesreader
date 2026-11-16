@@ -53,6 +53,7 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "hotpath",
+ "leftover",
  "memchr",
 ]
 
@@ -187,6 +188,15 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "leftover"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4554d317fa85dab55f81d9b505e694669adaae42f6755b8fad4e39ffd2eceff"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

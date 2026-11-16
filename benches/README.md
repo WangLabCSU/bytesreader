@@ -2,9 +2,17 @@
 
 ## reading
 
-Compare complete record reads with `BytesReader`, `std::io::BufReader`, and
-`BytesMut`. Results are grouped by item type and show median, minimum, and
-maximum times, along with throughput.
+Compare complete record reads with `BytesReader`, `LeftoverReader<BufReader<_>>`,
+`std::io::BufReader`, and `BytesMut`. Results are grouped by item type and show
+median, minimum, and maximum times, along with throughput.
+
+The `leftover` comparisons use `fill_view` with `take_view` for borrowed
+records and `take_owned` for a new `Vec<u8>` per record. Both accumulate
+records that span reads. A separate `leftover::read_until` comparison uses
+a fresh `Vec` per record, matching the standard `read_until` comparison.
+All methods use the same input and initial buffer capacity, and verify
+every record byte before timing. Default comparisons use 16 timed rounds;
+`--aligned-records` includes six additional controls and uses 22 rounds.
 
 ```sh
 cargo bench --bench reading

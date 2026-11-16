@@ -21,6 +21,7 @@ bytes = "1.12.*"
 hotpath = "0.30.*"
 
 [dev-dependencies]
+leftover = "0.0.2"
 memchr = "2.8"
 
 [profile.release]
